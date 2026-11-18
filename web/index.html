@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Tiny Swords — La Guerra dei Cinque Regni</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- OWNER: C4 (web/**). Built by build-web.ps1 / build-web.sh into ./pkg (wasm-bindgen --target web). -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #47aba9; overflow: hidden; }
+  canvas#game { display: block; width: 100%; height: 100%; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<script type="module">
+  const canvas = document.getElementById('game');
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.focus();
+  import init from './pkg/ts_client.js';
+  init().catch((e) => {
+    // winit uses an exception for control flow on the web: ignore it, report anything else
+    if (!String(e).includes('Using exceptions for control flow')) console.error(e);
+  });
+</script>
+</body>
+</html>
