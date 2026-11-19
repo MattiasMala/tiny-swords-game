@@ -4,11 +4,14 @@
 // Aesthetic, deterministic generator. Pipeline (`build`):
 //   1. land.rs    continent on a coarse 4x4 grid → run-jittered rectilinear coast; 5 kingdom sites ≥ 64 apart;
 //                 forced base land; mainland = 4-connected to base 0; inland ponds.
-//   2. relief.rs  20-40 plateaus (rectangle unions, morphologically cleaned) with south cliffs (some into the sea),
-//                 stairs at cliff-run ends, level-2 terraces; unreachable pockets → noBuild; hills ordered by
-//                 distance to the bases' centroid.  Then islets off the coast.
+//   2. relief.rs  20-38 plateaus covering ~30 % of the mainland (massifs first; rectangle unions, morphologically
+//                 cleaned) with south cliffs (some into the sea), stairs at cliff-run ends, level-2 terraces; the
+//                 lowland never split; unreachable pockets → noBuild; hills ordered by distance to the bases'
+//                 centroid.  Then islets off the coast.
 //   3. stock.rs   fair start stock (`near()`), mineral sites on plateaus (W4), capture points + their stock, big
-//                 deposits; roads.rs dirt roads between castles and to nearby points; then scattered groups.
+//                 deposits; roads.rs curving dirt tracks between neighbouring castles and spurs to nearby points
+//                 (+ invisible protected corridors from every stair); then scattered groups grown into a few big
+//                 compact woods (one species each).
 //   4. scenery.rs camps + chests, prop vignettes (ruins, farms, hamlets, graveyards, standing stones, wrecks...).
 //   5. prune unreachable objects, final static obstacles, `sound()` acceptance test (02 §5.2).
 //   6. decor.rs   bushes/rocks as transition glue, water rocks, ducks, clouds, ground details; surface.rs per-cell
@@ -18,6 +21,7 @@
 // NO sin/cos/atan2/powf/exp/ln (they may differ between native and wasm); rotations use literal cos/sin pairs.
 // No HashMap iteration. All randomness from one Mulberry32 stream per attempt.
 
+pub mod check;
 mod decor;
 pub mod grid;
 mod land;
@@ -83,6 +87,11 @@ pub fn attempt(seed: u32, attempt: u32) -> Result<GeneratedWorld, String> {
     build(seed, seed.wrapping_add(attempt.wrapping_mul(7919)), true)
 }
 
+/// Diagnostics: attempt `attempt` of `seed` without the acceptance test (`None` if its shape failed).
+pub fn attempt_unchecked(seed: u32, attempt: u32) -> Option<GeneratedWorld> {
+    build(seed, seed.wrapping_add(attempt.wrapping_mul(7919)), false).ok()
+}
+
 /// Last-resort world (never reached in practice): a rectangle island with the 5 bases on a pentagon.
 fn fallback_world(seed: u32) -> GeneratedWorld {
     let mut map = Map::new();
@@ -127,6 +136,10 @@ pub struct Search {
     dist: Vec<u32>,
     prev: Vec<u32>,
     touched: Vec<u32>,
+    /// per-cell road cost without the existing-road discount (0 = impassable), computed once per `roads()`
+    base: Vec<u16>,
+    /// per-cell meander term
+    wobble: Vec<u8>,
 }
 
 /// Generator state of one attempt.
@@ -171,6 +184,10 @@ pub struct Gen {
     islets: Vec<(i32, i32, i32, i32)>,
     /// forest/grove centres (cells) and radii
     woods: Vec<(f32, f32, f32)>,
+    /// species pair of each wood (parallel to `woods`)
+    wood_sp: Vec<(u8, u8)>,
+    /// species imposed on the next forest group (a group extending a wood keeps its species)
+    force_sp: Option<(u8, u8)>,
     /// cells blocked by solid props (cell, prop)
     solid: Vec<(i32, PropKind)>,
     /// road cells where spurs join the network (signposts)
@@ -213,6 +230,8 @@ impl Gen {
             ponds: Vec::new(),
             islets: Vec::new(),
             woods: Vec::new(),
+            wood_sp: Vec::new(),
+            force_sp: None,
             junctions: Vec::new(),
             solid: Vec::new(),
             rich: 1.0,
@@ -284,9 +303,81 @@ impl Gen {
         self.edge0 = grid::cheb_dist(&src, W, H, 40);
     }
 
+    /// Solid props must never seal off ground that is walkable without them (a ruin across a narrow plateau, a
+    /// fence closing a cove): props bordering such sealed cells are removed until every cell reachable on the
+    /// empty map is reachable again with the static props (points and bigs keep their 1-cell margins, so they
+    /// cannot seal anything alone). Resources do not count, as in the prune (a forest can be cut through).
+    fn unseal(&mut self) {
+        let n = self.map.len();
+        let goal0 = idx(self.bases[0].0, self.bases[0].1 + 2);
+        self.map.block.iter_mut().for_each(|v| *v = 0);
+        let free = compute_field(&self.map, &[goal0], 0, false);
+        for _ in 0..12 {
+            let mut sb = vec![0u8; n];
+            for (c, _) in &self.solid {
+                sb[*c as usize] = 1;
+            }
+            for c in self.points.iter().map(|p| p.cell).chain(self.bigs.iter().map(|b| b.1.cell)) {
+                for k in self.map.quad(c) {
+                    sb[k as usize] = 2;
+                }
+            }
+            self.map.block.copy_from_slice(&sb);
+            let way = compute_field(&self.map, &[goal0], 0, false);
+            let mut gone = vec![0u8; n];
+            let mut any = false;
+            for c in 0..n {
+                if sb[c] != 0 || free[c] == FIELD_INF || way[c] != FIELD_INF {
+                    continue;
+                }
+                let (x, y) = ((c as i32) % W, (c as i32) / W);
+                for (dx, dy) in DIRS8 {
+                    if self.map.inside(x + dx, y + dy) {
+                        let k = idx(x + dx, y + dy) as usize;
+                        if sb[k] == 1 {
+                            gone[k] = 1;
+                            any = true;
+                        }
+                    }
+                }
+            }
+            if !any {
+                break;
+            }
+            // a wide prop (anchored on the edge between its two cells: x on a multiple of 64) goes as a whole
+            for d in &self.map.decor {
+                if d.solid && (d.x as i32).rem_euclid(64) == 0 {
+                    let c = d.cell(&self.map);
+                    if c >= 0 && (c as usize) + 1 < n && (gone[c as usize] != 0 || gone[c as usize + 1] != 0) {
+                        gone[c as usize] = 1;
+                        gone[c as usize + 1] = 1;
+                    }
+                }
+            }
+            for (c, _) in &self.solid {
+                if gone[*c as usize] != 0 {
+                    self.used[*c as usize] = 0;
+                }
+            }
+            self.solid.retain(|(c, _)| gone[*c as usize] == 0);
+            let decor = std::mem::take(&mut self.map.decor);
+            let map = &self.map;
+            let kept: Vec<_> = decor
+                .into_iter()
+                .filter(|d| {
+                    let c = d.cell(map);
+                    !(d.solid && c >= 0 && gone[c as usize] != 0)
+                })
+                .collect();
+            self.map.decor = kept;
+        }
+        self.map.block.iter_mut().for_each(|v| *v = 0);
+    }
+
     /// Step 14: prune unreachable objects (resources do not block for this test), then the final static layer:
     /// trees, golds, stones, solid props, points and bigs.
     fn prune_and_block(&mut self) {
+        self.unseal();
         let n = self.map.len();
         let mut sb = vec![0u8; n];
         for (c, v) in self.solid.iter() {
@@ -403,6 +494,24 @@ impl Gen {
                 return Err(format!("base ({bx},{by}): no meadow"));
             }
         }
+        // every mine / quarry / sawmill / ranch kept its POINT_STOCK group after the prune (02 §6.7)
+        for p in &self.points {
+            let (x, y) = self.map.xy(p.cell);
+            let near = |c: i32, r: i32| {
+                let (cx, cy) = self.map.xy(c);
+                (cx - x - 1).abs() <= r && (cy - y - 1).abs() <= r
+            };
+            let ok = match p.kind {
+                PointKind::Mine => self.golds.iter().any(|d| near(d.cell, 8)),
+                PointKind::Quarry => self.stones.iter().any(|d| near(d.cell, 8)),
+                PointKind::Sawmill => self.trees.iter().any(|t| near(t.cell, 9)),
+                PointKind::Ranch => self.meadows.iter().any(|q| near(self.map.cell_of(*q), 8)),
+                PointKind::Outpost => true,
+            };
+            if !ok {
+                return Err(format!("{:?} point ({x},{y}) without its resources", p.kind));
+            }
+        }
         Ok(())
     }
 
@@ -419,14 +528,26 @@ impl Gen {
 /// One generation attempt (`seed` = match seed reported in the result, `s` = attempt seed); `Err` = why it was
 /// rejected.
 fn build(seed: u32, s: u32, check: bool) -> Result<GeneratedWorld, String> {
+    build_marked(seed, s, check, &mut |_| {})
+}
+
+/// Diagnostics: attempt `attempt` of `seed` (unchecked) calling `mark(stage)` after every pipeline stage (the
+/// example uses it for timings; the generator itself never reads a clock).
+pub fn profile(seed: u32, attempt: u32, mark: &mut dyn FnMut(&'static str)) -> Option<GeneratedWorld> {
+    build_marked(seed, seed.wrapping_add(attempt.wrapping_mul(7919)), false, mark).ok()
+}
+
+fn build_marked(seed: u32, s: u32, check: bool, mark: &mut dyn FnMut(&'static str)) -> Result<GeneratedWorld, String> {
     let mut g = Gen::new(s);
     if !g.shape_land() {
         return Err("kingdom sites".into());
     }
+    mark("land");
     g.ponds();
     if !g.relief() {
         return Err("too few plateaus".into());
     }
+    mark("relief");
     g.islets = g.islets();
     let solid = g.map.land.iter().filter(|v| **v == 1).count();
     g.rich = solid as f64 / ((W * H) as f64 * 0.71);
@@ -434,16 +555,23 @@ fn build(seed: u32, s: u32, check: bool) -> Result<GeneratedWorld, String> {
 
     g.base_stock();
     g.points_and_bigs();
+    mark("islets+stock+points");
     g.roads();
+    mark("roads");
     g.plateau_stock();
     g.scattered();
+    mark("scattered");
     g.scenery();
+    mark("scenery");
     g.prune_and_block();
     if check {
         g.sound()?;
     }
+    mark("prune+sound");
     g.decorate();
+    mark("decorate");
     g.surfaces();
+    mark("surfaces");
 
     g.map.version += 1;
     g.map.opened = g.map.version;

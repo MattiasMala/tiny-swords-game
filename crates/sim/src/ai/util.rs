@@ -57,10 +57,14 @@ impl World {
 
     /// `findSpot(kind, x0, y0, rmin, rmax)` (factions.js:177-199, 04a §9.4 + addenda E8): rings `r = rmin..=rmax`
     /// around cell `(x0, y0)`, ring offsets shuffled with the sim RNG (Fisher–Yates); the first top-left cell
-    /// where `canPlace` holds and the 1-cell border around the footprint is inside and passable. Does NOT check
-    /// the build zone (the `place` command does).
+    /// where `canPlace` holds and the 1-cell border around the footprint is inside and passable.
+    /// DEVIATION (reviewer fix): candidates outside `f`'s build zone are skipped too. JS leaves the zone to the
+    /// `place` command, so a tower (12-cell defense zone) or a far depot whose first roomy ring cell lies out of
+    /// the zone fails every think and the plan stalls on that step for the rest of the match (seen in simbench,
+    /// hard: plan stuck on the second tower, no more techs).
     pub fn ai_find_spot(
         &mut self,
+        f: FactionIdx,
         kind: BuildingKind,
         x0: i32,
         y0: i32,
@@ -82,12 +86,32 @@ impl World {
                 // JS Math.round: halves round up (toward +inf)
                 let cx = js_round((x0 + dx) as f32 - d.w as f32 / 2.0);
                 let cy = js_round((y0 + dy) as f32 - d.h as f32 / 2.0);
-                if self.ai_roomy(kind, cx, cy) {
+                if self.ai_in_zone(f, kind, cx, cy) && self.ai_roomy(kind, cx, cy) {
                     return Some((cx, cy));
                 }
             }
         }
         None
+    }
+
+    /// `zoneBlock(f, kind, cx, cy) == null` without building the refusal string: footprint centre within 12
+    /// (defense) / 40 cells of the castle centre, or within 9 of an owned outpost.
+    fn ai_in_zone(&self, f: FactionIdx, kind: BuildingKind, cx: i32, cy: i32) -> bool {
+        let d = kind.def();
+        let (x, y) = (cx as f32 + d.w as f32 / 2.0, cy as f32 + d.h as f32 / 2.0);
+        let r = if d.defense { DEFENSE_RADIUS } else { BUILD_RADIUS };
+        let Some(fac) = self.factions.get(f as usize) else {
+            return false;
+        };
+        if let Some(c) = fac.castle.and_then(|c| self.buildings.get(c)) {
+            let (ccx, ccy) = c.center_cells();
+            if (x - ccx).hypot(y - ccy) <= r {
+                return true;
+            }
+        }
+        self.points
+            .iter()
+            .any(|p| p.owner == Some(f) && p.kind.def().zone && (x - p.gx).hypot(y - p.gy) <= OUTPOST_RADIUS)
     }
 
     /// `roomy(cx, cy)` of `findSpot`: `canPlace` + passable 1-cell corridor all around.

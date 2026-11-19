@@ -10,6 +10,13 @@ use crate::events::{GameEvent, Msg, dur};
 use crate::math::{V2, v2};
 use crate::slab::UnitId;
 use crate::world::Order;
+use crate::TILE;
+use crate::path::FieldTarget;
+use crate::slab::BuildingId;
+
+/// Seconds a wave may go without fighting or getting 150 px closer to the target castle before it is sent home
+/// (reviewer addition, see `ai_march`).
+pub const AI_MARCH_STALL: f32 = 120.0;
 
 /// Result of `aiSpare` (04b §9.1).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -188,6 +195,8 @@ impl World {
                 phase: WavePhase::March,
                 leg_t: -99.0,
                 t0: now,
+                best_d: super::AI_FAR,
+                best_t: now,
             });
             ai.due_t = None;
             ai.target = Some(target);
@@ -261,9 +270,11 @@ impl World {
             self.factions[f as usize].ai.target = Some(next);
             w.phase = WavePhase::March;
             w.leg_t = -99.0;
+            w.best_d = super::AI_FAR;
+            w.best_t = self.time;
         }
-        let tgt = self.factions[w.target as usize]
-            .castle
+        let tgt_id = self.factions[w.target as usize].castle;
+        let tgt = tgt_id
             .and_then(|c| self.buildings.get(c))
             .filter(|b| !b.dead)
             .map(|b| (b.pos, b.rect.y1, b.hp, b.max_hp));
@@ -275,6 +286,23 @@ impl World {
         let d_t = tc.dist(cen);
         if value < l.retreat * w.start && tc_hp > 0.3 * tc_max {
             self.order_units(f, &units, OrderKind::Move, home_pt.x, home_pt.y, None);
+            let ai = &mut self.factions[f as usize].ai;
+            ai.wave_t = ai.wave_t.max(40.0);
+            return;
+        }
+        // DEVIATION (reviewer addition): a wave that neither gets 150 px closer to the target castle nor fights for
+        // `AI_MARCH_STALL` s (target unreachable from where it stands) goes home like a retreat, instead of
+        // idling forever and blocking every later wave and capture squad.
+        let fighting = fighters
+            .iter()
+            .any(|id| self.units.get(*id).is_some_and(|u| u.target.is_some()));
+        if d_t < w.best_d - 150.0 {
+            w.best_d = d_t;
+            w.best_t = self.time;
+        } else if fighting {
+            w.best_t = self.time;
+        } else if self.time - w.best_t > AI_MARCH_STALL {
+            self.order_units(f, &units, OrderKind::AMove, home_pt.x, home_pt.y, None);
             let ai = &mut self.factions[f as usize].ai;
             ai.wave_t = ai.wave_t.max(40.0);
             return;
@@ -297,7 +325,19 @@ impl World {
                 .count();
             if waiting as f32 >= 0.75 * fighters.len() as f32 || self.time - w.leg_t > 35.0 {
                 let step = 700.0f32.min(d_t - 500.0);
-                let p = self.map.nearest_passable(cen + (tc - cen) / d_t * step);
+                // DEVIATION (reviewer fix): the JS leg is a point on the straight line toward the castle; on the
+                // terraced map (cliffs, stairs, rivers) that point is often on another level or across water, the
+                // move stalls at once and the wave idles in place forever (seen in simbench: waves stuck for 20+
+                // game minutes, blocking every later wave and capture). The leg now follows the walking path to
+                // the castle for `step` px; the straight line stays the fallback when no path exists.
+                let lead = fighters
+                    .iter()
+                    .filter_map(|id| self.units.get(*id).map(|u| u.pos))
+                    .min_by(|a, b| a.dist2(cen).partial_cmp(&b.dist2(cen)).unwrap_or(core::cmp::Ordering::Equal))
+                    .unwrap_or(cen);
+                let p = tgt_id
+                    .and_then(|b| self.ai_path_leg(f, lead, b, step))
+                    .unwrap_or_else(|| self.map.nearest_passable(cen + (tc - cen) / d_t * step));
                 self.order_units(f, &units, OrderKind::AMove, p.x, p.y, None);
                 w.leg_t = self.time;
             }
@@ -336,6 +376,38 @@ impl World {
             w = w2;
         }
         self.factions[f as usize].ai.wave = Some(w);
+    }
+
+    /// Point `step` px down the walking path from `from` toward the castle `b` (distance field of the castle ring,
+    /// own side), or `None` when `from` cannot reach it.
+    pub(crate) fn ai_path_leg(&mut self, f: FactionIdx, from: V2, b: BuildingId, step: f32) -> Option<V2> {
+        let side = side_of(f);
+        let a = self.map.cell_of(from);
+        if a < 0 {
+            return None;
+        }
+        let fr = self.field_for(FieldTarget::Building(b), side, a);
+        if self.fields.dist(fr.id, a) >= FIELD_INF {
+            return None;
+        }
+        let w = self.map.w;
+        let mut c = a;
+        let mut walked = 0.0f32;
+        // bounded walk: each step lowers the field value, at most a few dozen cells
+        let max_steps = (step / TILE * 2.0).ceil() as usize + 2;
+        for _ in 0..max_steps {
+            if walked >= step || self.fields.dist(fr.id, c) == 0 {
+                break;
+            }
+            let n = self.step_from(fr.id, c, side, fr.crossed);
+            if n < 0 || n == c {
+                break;
+            }
+            let diag = (n - c).abs() != 1 && (n - c).abs() != w;
+            walked += if diag { TILE * core::f32::consts::SQRT_2 } else { TILE };
+            c = n;
+        }
+        Some(self.map.center(c))
     }
 
     /// `aiDefend(f, intel, stepCost)` (04b §9.5).

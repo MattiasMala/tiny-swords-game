@@ -2,7 +2,7 @@
 # Builds the browser client into web/pkg (OWNER: C4).
 #   ./build-web.sh            then: cargo run -p ts-server --release   (http://localhost:8000)
 #   NOOPT=1 ./build-web.sh    skip wasm-opt (faster, bigger)
-# Steps: cargo (profile wasm-release: opt-level "s", fat LTO, 1 CGU) -> wasm-bindgen (must match the wasm-bindgen
+# Steps: cargo (profile wasm-release: opt-level "z" (sim crate 3), fat LTO, 1 CGU) -> wasm-bindgen (must match the wasm-bindgen
 # crate version in Cargo.lock) -> wasm-opt (binaryen; downloaded into ~/.cargo/bin when missing).
 set -eu
 cd "$(dirname "$0")"
@@ -67,8 +67,9 @@ if [ -z "${NOOPT:-}" ]; then
     fi
   fi
   if [ -n "$OPT" ]; then
-    # features used by rustc's default wasm32 target; -O3: speed matters (sim + 60 fps), it still shrinks
-    "$OPT" -O3 --strip-debug --strip-producers \
+    # features used by rustc's default wasm32 target. -Oz: about 10 % smaller than -O3 (25 vs 28 MB); the browser JIT
+    # inlines small hot functions anyway, and the sim crate is compiled at opt-level 3 by cargo
+    "$OPT" -Oz --strip-debug --strip-producers \
       --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals \
       --enable-reference-types --enable-multivalue \
       -o "$BG" "$BG"

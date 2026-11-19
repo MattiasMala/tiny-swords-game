@@ -3,7 +3,6 @@
 
 use super::kit::{ACCENT, GREEN, INK, IconSpec, RED, Ui, WHITE, faction_color, panel, res_icon, ui_icon, x_icon};
 use super::paint::{Align, Tip};
-use super::screens::free_building;
 use super::{Env, UiState, View};
 use crate::control::{ActionId, ClickAction, ControlAction, PlaceMode, context_actions};
 use bevy::prelude::*;
@@ -14,7 +13,7 @@ use ts_sim::defs::{
     POINT_INCOME, Res, SHEEP_MEAT, Sound, TRAIN_BONUS, UnitKind, buy_price, sell_price,
     train_speed,
 };
-use ts_sim::slab::{BuildingId, NodeId, UnitId};
+use ts_sim::slab::{NodeId, UnitId};
 use ts_sim::snapshot_types::{BuildingView, UnitView};
 
 // ---------------------------------------------------------------------------------------------- bridges to C4
@@ -622,6 +621,4 @@ fn draw_actions(
             env.ctl.write(ControlAction::Act(a.id));
         }
     }
-    let _ = free_building;
-    let _: Option<BuildingId> = None;
 }

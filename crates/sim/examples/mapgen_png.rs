@@ -245,6 +245,33 @@ fn render(g: &GeneratedWorld, s: usize, crop: (i32, i32, i32, i32)) -> Img {
                     PropKind::Grass | PropKind::TallGrass | PropKind::Ferns => hex(0x4a8a3a),
                     PropKind::Pebbles | PropKind::Puddle | PropKind::Bones => hex(0xb0b8bc),
                     PropKind::Mushrooms | PropKind::Sticks | PropKind::FallenLog | PropKind::Stump => hex(0x8a6a4a),
+                    // ruins / stones: pale stone
+                    PropKind::Statue
+                    | PropKind::Column
+                    | PropKind::RuinArch
+                    | PropKind::RuinWall
+                    | PropKind::Menhir
+                    | PropKind::StoneCircle
+                    | PropKind::Boulder
+                    | PropKind::Shrine
+                    | PropKind::Obelisk
+                    | PropKind::Grave => hex(0xd8d4c8),
+                    // farm / village wood
+                    PropKind::Windmill
+                    | PropKind::Scarecrow
+                    | PropKind::Hay
+                    | PropKind::Fence
+                    | PropKind::Well
+                    | PropKind::Beehive
+                    | PropKind::Signpost => hex(0xe0b060),
+                    // camp / wreck
+                    PropKind::Tent | PropKind::Campfire => hex(0xff5030),
+                    PropKind::Barrel
+                    | PropKind::Crate
+                    | PropKind::Logs
+                    | PropKind::Cart
+                    | PropKind::WagonWreck
+                    | PropKind::Deadtree => hex(0x9a6a3a),
                     _ => hex(0xc040c0),
                 };
                 if d.solid {
@@ -265,8 +292,8 @@ fn render(g: &GeneratedWorld, s: usize, crop: (i32, i32, i32, i32)) -> Img {
             2 => hex(0xa6c43a),
             _ => hex(0xe08a2a),
         };
-        img.disc(x, y, r * 1.15, shade(col, 0.75));
-        img.disc(x - sf * 0.08, y - sf * 0.1, r * 0.85, col);
+        img.disc(x, y, r * 1.45, shade(col, 0.7));
+        img.disc(x - sf * 0.1, y - sf * 0.12, r * 1.05, col);
     }
     for d in &g.golds {
         let p = m.center(d.cell);
@@ -347,14 +374,97 @@ fn main() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--profile") {
+        for &seed in &seeds {
+            let mut t = Instant::now();
+            let mut line = format!("seed {seed}:");
+            ts_sim::mapgen::profile(seed, 0, &mut |stage| {
+                line += &format!(" {stage} {:.1}", t.elapsed().as_secs_f64() * 1000.0);
+                t = Instant::now();
+            });
+            println!("{line}");
+        }
+        return;
+    }
+    if let Some(n) = get("--check").and_then(|v| v.parse::<u32>().ok()) {
+        // invariants + timing over n seeds (the test seeds), no images
+        let (mut worst, mut total, mut bad) = (0.0f64, 0.0f64, 0);
+        for k in 0..n {
+            let seed = k.wrapping_mul(2_654_435_761).wrapping_add(17);
+            let t = Instant::now();
+            let (g, attempts, sound) = generate_report(seed, &setup);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            worst = worst.max(ms);
+            total += ms;
+            let res = ts_sim::mapgen::check::check_invariants(&g);
+            if res.is_err() || !sound {
+                bad += 1;
+            }
+            println!("seed {seed}: {ms:.0} ms, attempts {attempts}, sound {sound}, {:?}", res);
+        }
+        println!("{n} seeds: {bad} bad, avg {:.0} ms, worst {worst:.0} ms", total / n.max(1) as f64);
+        return;
+    }
+    let forced = get("--attempt").and_then(|v| v.parse::<u32>().ok());
     for &seed in &seeds {
         let t = Instant::now();
-        let (g, attempts, checked) = generate_report(seed, &setup);
+        let (g, attempts, checked) = match forced {
+            Some(k) => match ts_sim::mapgen::attempt_unchecked(seed, k) {
+                Some(g) => (g, k + 1, false),
+                None => {
+                    println!("seed {seed} attempt {k}: shape failed");
+                    continue;
+                }
+            },
+            None => generate_report(seed, &setup),
+        };
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let m = &g.map;
+        if let Some(v) = get("--dump") {
+            // --dump x,y,w,h : per-cell "level/plateau/stair/cliff/land" grid
+            let p: Vec<i32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if p.len() == 4 {
+                let b0 = m.idx(g.bases[0].0, g.bases[0].1 + 2);
+                let f = ts_sim::path::compute_field(m, &[b0], 0, false);
+                for y in p[1]..p[1] + p[3] {
+                    let row: Vec<String> = (p[0]..p[0] + p[2])
+                        .map(|x| {
+                            let c = m.idx(x, y) as usize;
+                            let r = if m.static_block[c] != 0 {
+                                'B'
+                            } else if f[c] < u32::MAX {
+                                '*'
+                            } else {
+                                ' '
+                            };
+                            format!("{}{:>2}{}{}{}{r}", m.level[c], m.plateau[c], m.stair[c], if m.cliff[c] != 0 { 'C' } else { '.' }, m.land[c])
+                        })
+                        .collect();
+                    println!("{y:>3}: {}", row.join(" "));
+                }
+            }
+        }
         let land = m.land.iter().filter(|v| **v == 1).count();
         let l1 = (0..m.len()).filter(|c| m.land[*c] == 1 && m.level[*c] == 1).count();
         let l2 = (0..m.len()).filter(|c| m.land[*c] == 1 && m.level[*c] == 2).count();
+        // road cells touching another road cell only by a corner (should be 0: tracks are 4-connected)
+        let path = |x: i32, y: i32| m.inside(x, y) && m.surface[m.idx(x, y) as usize] == Surface::Path;
+        let mut corner_only = 0;
+        for y in 0..m.h {
+            for x in 0..m.w {
+                if !path(x, y) {
+                    continue;
+                }
+                for (dx, dy) in [(1, 1), (-1, 1)] {
+                    if path(x + dx, y + dy) && !path(x + dx, y) && !path(x, y + dy) {
+                        corner_only += 1;
+                    }
+                }
+            }
+        }
+        if corner_only > 0 {
+            println!("seed {seed}: {corner_only} corner-only road contacts");
+        }
         let props = m.decor.iter().filter(|d| matches!(d.kind, DecorKind::Prop(_))).count();
         let solid = m.decor.iter().filter(|d| d.solid).count();
         let bushes = m.decor.iter().filter(|d| d.kind == DecorKind::Bush).count();

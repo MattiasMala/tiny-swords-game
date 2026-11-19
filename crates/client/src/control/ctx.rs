@@ -141,6 +141,13 @@ pub fn context_actions(mirror: &Mirror, sel: &Selection, place: &Placement) -> V
     out
 }
 
+/// JS `Math.round`: halves go up (towards +∞), unlike `f32::round` (away from zero) — matters for the -0.5 cells at
+/// the map's left / top edge.
+#[inline]
+pub(crate) fn js_round(v: f32) -> i32 {
+    (v + 0.5).floor() as i32
+}
+
 /// Building foot point / footprint helpers (sim px).
 pub fn building_foot(b: &BuildingView) -> Vec2 {
     let d = b.kind.def();
@@ -412,7 +419,7 @@ impl Ctx<'_> {
         let except = |g: &[UnitId]| -> Vec<UnitId> {
             own.iter().copied().filter(|id| !g.contains(id)).collect()
         };
-        let (wx, wy) = (w.x.round(), w.y.round());
+        let (wx, wy) = (js_round(w.x) as f32, js_round(w.y) as f32);
         let mut sends: Vec<(Vec<UnitId>, OrderKind, Option<EntityRef>)> = Vec::new();
         let mut mark = MarkKind::Move;
         let enemy = match target {
@@ -507,7 +514,7 @@ impl Ctx<'_> {
                 .is_some_and(|tb| Some(tb.faction) == me && !tb.done),
             _ => false,
         };
-        let (wx, wy) = (w.x.round(), w.y.round());
+        let (wx, wy) = (js_round(w.x) as f32, js_round(w.y) as f32);
         self.net.command(Command::Rally {
             building: b,
             x: wx,
@@ -719,8 +726,8 @@ impl Ctx<'_> {
         self.place.mode = PlaceMode::Place(kind);
         self.place.kind = Some(kind);
         self.place.cell = IVec2::new(
-            (c.x / TILE - d.w as f32 / 2.0).round() as i32,
-            (c.y / TILE - d.h as f32 / 2.0).round() as i32,
+            js_round(c.x / TILE - d.w as f32 / 2.0),
+            js_round(c.y / TILE - d.h as f32 / 2.0),
         );
         self.place.ok = false;
         self.place.why = None;
@@ -1077,8 +1084,8 @@ impl Ctx<'_> {
             .any(|id| self.unit(*id).is_some_and(|u| u.kind == UnitKind::Pawn));
         for i in 1..=n {
             let k = i as f32 / n as f32;
-            let cx = (from.x as f32 + (to.x - from.x) as f32 * k).round() as i32;
-            let cy = (from.y as f32 + (to.y - from.y) as f32 * k).round() as i32;
+            let cx = js_round(from.x as f32 + (to.x - from.x) as f32 * k);
+            let cy = js_round(from.y as f32 + (to.y - from.y) as f32 * k);
             if self.place_why(cx, cy).is_none() {
                 let builders = if mine_sel {
                     self.builders(BuildingKind::Wall, cx, cy)

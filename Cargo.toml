@@ -5,7 +5,6 @@ members = ["crates/sim", "crates/server", "crates/client"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-license = "MIT"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -24,15 +23,21 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# wasm (OWNER C4, see build-web.*): size-optimised. The old opt-level 3 build was 49.5 MB (43 MB of code, no debug
-# info): "s" + fat LTO + one codegen unit, then wasm-opt. Built with:
+# wasm (OWNER C4, see build-web.*): size-optimised. Measured on the full client (Nov 2026), after wasm-bindgen +
+# wasm-opt: opt-level 3 = 49.5 MB; "s" + fat LTO = 33.8 MB (-O3) / 29.5 MB (-Oz); "z" = 28.0 MB (-O3) / 25.4 MB (-Oz).
+# ~75 % of the code is Bevy itself (bevy_ecs system monomorphisation, reflection, wgpu/naga, pbr), so this is
+# about the floor without dropping engine features; over the wire it is ~8 MB (the server compresses with br/gzip).
+# The simulation crate keeps opt-level 3 (5 AI kingdoms + hundreds of units at 20 Hz). Built with:
 #   cargo build -p ts-client --lib --profile wasm-release --target wasm32-unknown-unknown
 [profile.wasm-release]
 inherits = "release"
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 debug = false
 # debuginfo only: keeps the custom sections wasm-bindgen reads
 strip = "debuginfo"
 panic = "abort"
+
+[profile.wasm-release.package.ts-sim]
+opt-level = 3

@@ -4,14 +4,16 @@
 // light, 1 cascade, ≤ 204 clustered lights).
 //
 // * `LightState` = the JS `Light` record: phase, ambient (0..1 rgb), night, shade, smoothed sun direction, quality
-//   level (2 complete / 1 light / 0 off) and auto-degrade state. `--time T` overrides the day phase.
+//   level (2 complete / 1 light / 0 off, mirrored from C4's `GraphicsQuality`: F2 + auto-degrade live there).
+//   `--time T` overrides the day phase.
 // * One shadow-casting `DirectionalLight` (sun / moon). Its colour follows the ambient keyframes; its strength vs the
 //   `GlobalAmbientLight` follows `shade` so that shadowed ground keeps `1 - shade·k` of the lit brightness.
 // * Point lights: every draw system pushes `LightSrc` candidates (buildings, burning buildings, owned capture points,
 //   campfires, shrines, gold veins); the `MAX_POINT_LIGHTS` nearest the view centre become pooled `PointLight`s with
 //   the JS flicker, intensity ∝ `power_eff·(0.25 + 0.75·night)`; at night additive glow halos (`r·0.62`, alpha
 //   `0.3·night·power_eff`) are drawn as sprites.
-// * Camera post (level 2): `Hdr` + `Bloom` + `Vignette` (`0.75 + 0.2·night`); tonemapping always.
+// * Camera post (level 2): `Hdr` + `Bloom` + `Vignette` (`0.75 + 0.2·night`) + `DioramaPost` (tilt-shift bands and
+//   sun shafts, `shaders/light_post.wesl`, after tonemapping); tonemapping always.
 
 use crate::AppState;
 use crate::assets::SpriteAtlas;
@@ -21,13 +23,19 @@ use crate::render::anim::WorldClock;
 use crate::render::camera::RtsCamera;
 use crate::render::sprites::{Basis, Flavor, Layer, Painter, SpriteBatches, SpriteSystems};
 use crate::render::sprites_world::{NONE, Sheets};
-use crate::ui::UiState;
+use crate::control::GraphicsQuality;
+use bevy::asset::embedded_asset;
 use bevy::camera::Hdr;
+use bevy::core_pipeline::fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::CascadeShadowConfigBuilder;
 use bevy::post_process::bloom::Bloom;
 use bevy::post_process::effect_stack::Vignette;
 use bevy::prelude::*;
+use bevy::render::{RenderApp, extract_component::ExtractComponent, render_resource::ShaderType};
+use bevy::ecs::schedule::ScheduleConfigs;
+use bevy::ecs::system::BoxedSystem;
+use bevy::shader::ShaderRef;
 use ts_sim::defs::DAY_KEYS;
 
 /// Day phase 0..1 used by the lighting (kept for other modules).
@@ -80,8 +88,6 @@ pub struct LightState {
     pub ly: f32,
     /// 2 complete, 1 light, 0 off
     pub level: u8,
-    pub auto: bool,
-    slow: f32,
     applied_level: Option<u8>,
 }
 
@@ -95,8 +101,6 @@ impl Default for LightState {
             lx: 0.0,
             ly: 0.4,
             level: 2,
-            auto: true,
-            slow: 0.0,
             applied_level: None,
         }
     }
@@ -155,7 +159,9 @@ pub struct LightPlugin;
 
 impl Plugin for LightPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DayTime>()
+        embedded_asset!(app, "shaders/light_post.wesl");
+        app.add_plugins(FullscreenMaterialPlugin::<DioramaPost>::default())
+            .init_resource::<DayTime>()
             .init_resource::<LightState>()
             .init_resource::<LightCandidates>()
             .insert_resource(GlobalAmbientLight {
@@ -167,7 +173,7 @@ impl Plugin for LightPlugin {
             .add_systems(
                 Update,
                 (
-                    (quality_keys, watch_fps, update_day, camera_post).chain(),
+                    (sync_level, update_day, camera_post, update_diorama, shadow_range).chain(),
                     clear_candidates.in_set(SpriteSystems::Prepare),
                     (draw_halos, place_point_lights)
                         .chain()
@@ -217,58 +223,18 @@ fn spawn_sun(mut commands: Commands) {
     }
 }
 
-/// F2: cycle the light level 2 → 1 → 0 → 2 (`Light.cycle`), manual from then on.
-fn quality_keys(
-    keys: Res<ButtonInput<KeyCode>>,
-    state: Res<State<AppState>>,
-    mut ls: ResMut<LightState>,
-    mut ui: ResMut<UiState>,
-) {
-    if ui.keyboard_captured || *state.get() != AppState::InGame {
-        return;
-    }
-    if keys.just_pressed(KeyCode::F2) {
-        ls.level = (ls.level + 2) % 3;
-        ls.auto = false;
-        ui.toast(match ls.level {
-            0 => "Luci spente",
-            1 => "Luci leggere: senza sfocatura, bagliore e raggi",
-            _ => "Luci complete",
-        });
-    }
-}
-
-/// `Light.watch(dt)`: after 3 s accumulated over slow frames (> 33 ms) drop one level, with a toast.
-fn watch_fps(
-    time: Res<Time<Real>>,
-    state: Res<State<AppState>>,
-    dev: Res<DevArgs>,
-    mut ls: ResMut<LightState>,
-    mut ui: ResMut<UiState>,
-) {
-    let dt = time.delta_secs();
-    if *state.get() != AppState::InGame || !ls.auto || ls.level == 0 || dt > 0.25 {
-        return;
-    }
-    // dev screenshots render a few frames as fast as possible: never degrade there
-    if dev.screenshot.is_some() {
-        return;
-    }
-    ls.slow = if dt > 0.03 {
-        ls.slow + dt
+/// The light level follows `control::GraphicsQuality` (C4 owns the F2 key, the slow-frame watchdog and their toasts,
+/// spec 07 §7). Dev screenshots render their first frames as fast as possible while pipelines compile: there an
+/// automatic drop is ignored (a level chosen with F2 still applies).
+fn sync_level(dev: Res<DevArgs>, q: Res<GraphicsQuality>, mut ls: ResMut<LightState>) {
+    let level = if dev.screenshot.is_some() && q.lights_auto {
+        2
     } else {
-        (ls.slow - dt * 2.0).max(0.0)
+        q.lights.min(2)
     };
-    if ls.slow < 3.0 {
-        return;
+    if ls.level != level {
+        ls.level = level;
     }
-    ls.level -= 1;
-    ls.slow = 0.0;
-    ui.toast(if ls.level > 0 {
-        "Il gioco rallentava: luci alleggerite (F2 per cambiarle)"
-    } else {
-        "Il gioco rallentava: luci spente (F2 per riaccenderle)"
-    });
 }
 
 /// Brightness of fully lit flat ground (linear, before tonemapping) — calibrated so day art keeps its colours.
@@ -353,6 +319,28 @@ fn update_day(
     }
 }
 
+/// The single shadow cascade covers what the camera sees: its far bound follows the zoom (eye distance), so zoomed
+/// out views keep their shadows and zoomed in views get sharper ones.
+fn shadow_range(
+    rig: Res<crate::render::camera::CameraRig>,
+    mut q: Query<&mut bevy::light::CascadeShadowConfig, With<Sun>>,
+) {
+    let far = (rig.distance() * 2.6).clamp(30.0, 180.0);
+    for mut c in &mut q {
+        let cur = c.bounds.last().copied().unwrap_or(0.0);
+        if (cur - far).abs() > far * 0.08 {
+            *c = CascadeShadowConfigBuilder {
+                num_cascades: 1,
+                minimum_distance: 1.0,
+                maximum_distance: far,
+                first_cascade_far_bound: far,
+                overlap_proportion: 0.2,
+            }
+            .build();
+        }
+    }
+}
+
 /// Camera post-processing per level (Hdr + Bloom + Vignette at level 2, tonemapping always).
 fn camera_post(
     mut commands: Commands,
@@ -394,6 +382,84 @@ fn camera_post(
     }
 }
 
+/// Level-2 "diorama" post pass (spec 07 §6): tilt-shift bands + sun shafts (`shaders/light_post.wesl`), on the game
+/// camera only while the light level is 2.
+#[derive(Component, ExtractComponent, Clone, Copy, ShaderType, Default, Debug)]
+#[extract_app(RenderApp)]
+pub struct DioramaPost {
+    /// top band fraction, bottom band fraction, blur radius (px at 720 rows), band strength
+    pub band: Vec4,
+    /// sun strength, lean, time (s), unused
+    pub shafts: Vec4,
+    /// linear shaft colour × gain
+    pub shaft_color: Vec4,
+}
+
+impl FullscreenMaterial for DioramaPost {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://ts_client/render/shaders/light_post.wesl".into()
+    }
+
+    // After tonemapping: the default slot (before tonemapping) is unordered with respect to Bloom and the effect stack
+    // (vignette) and their main-texture ping-pong, which garbles the frame. Here it runs strictly after both.
+    fn schedule_configs(system: ScheduleConfigs<BoxedSystem>) -> ScheduleConfigs<BoxedSystem> {
+        system
+            .in_set(bevy::core_pipeline::Core3dSystems::PostProcess)
+            .after(bevy::core_pipeline::tonemapping::tonemapping)
+    }
+}
+
+/// Tilt-shift bands of `Light.post` step 4: `top = 22 %`, `bottom = 18 %` of the screen height.
+const BAND_TOP: f32 = 0.22;
+const BAND_BOTTOM: f32 = 0.18;
+/// Blur radius of the bands (px at 720 rows; the 2D game blurs a quarter-resolution copy ≈ 3-4 px).
+const BAND_BLUR: f32 = 4.5;
+/// Shaft brightness (added to the tonemapped frame like the 2D shafts: net alpha `0.085·sun·(0.6..1)`).
+const SHAFT_GAIN: f32 = 1.0;
+
+/// Adds / removes / updates the diorama pass (`Light.shafts`: `sun = (1 - night)·(0.45 + 0.55·|lx|)`, lean `-lx/2`,
+/// presentation time so the shafts stop while the game is paused, addenda L3).
+fn update_diorama(
+    mut commands: Commands,
+    ls: Res<LightState>,
+    clock: Res<WorldClock>,
+    state: Res<State<AppState>>,
+    mut cams: Query<(Entity, Option<&mut DioramaPost>), With<RtsCamera>>,
+) {
+    let Ok((e, post)) = cams.single_mut() else {
+        return;
+    };
+    let want = ls.level >= 2 && matches!(state.get(), AppState::InGame | AppState::Menu);
+    if !want {
+        if post.is_some() {
+            commands.entity(e).remove::<DioramaPost>();
+        }
+        return;
+    }
+    let sun = (1.0 - ls.night) * (0.45 + 0.55 * ls.lx.abs());
+    let c = Color::srgb_u8(255, 244, 210).to_linear();
+    let v = DioramaPost {
+        band: Vec4::new(BAND_TOP, BAND_BOTTOM, BAND_BLUR, 1.0),
+        shafts: Vec4::new(
+            if sun > 0.05 { sun } else { 0.0 },
+            -ls.lx * 0.5,
+            (clock.t % 100_000.0) as f32,
+            0.0,
+        ),
+        shaft_color: Vec4::new(c.red, c.green, c.blue, 0.0) * SHAFT_GAIN,
+    };
+    match post {
+        Some(mut p) => {
+            if p.band != v.band || p.shafts != v.shafts || p.shaft_color != v.shaft_color {
+                *p = v;
+            }
+        }
+        None => {
+            commands.entity(e).insert(v);
+        }
+    }
+}
+
 fn clear_candidates(mut c: ResMut<LightCandidates>) {
     c.list.clear();
 }
@@ -408,7 +474,8 @@ fn draw_halos(
     cands: Res<LightCandidates>,
     mut batches: ResMut<SpriteBatches>,
 ) {
-    if !atlas.ready || !basis.valid || ls.level < 2 || ls.night <= 0.02 || sheets.glow == NONE {
+    // `Light.apply` step 2: halos belong to light levels 1 and 2 (spec 07 §5, §7)
+    if !atlas.ready || !basis.valid || ls.level < 1 || ls.night <= 0.02 || sheets.glow == NONE {
         return;
     }
     let t = clock.t as f32;

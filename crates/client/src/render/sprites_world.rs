@@ -18,7 +18,7 @@ use crate::render::consts::PX;
 use crate::render::light::{LightCandidates, LightSrc};
 use crate::render::sprites::{
     Basis, DrawStage, Flavor, Ghost, HitTarget, Layer, Painter, SpriteBatches, SpriteHit,
-    SpriteHits, SpriteOpts, drawable, foot_world, ground_at, prio,
+    SpriteHits, SpriteOpts, drawable, foot_world, prio,
 };
 use crate::render::terrain::FogTexture;
 use bevy::platform::collections::{HashMap, HashSet};
@@ -31,7 +31,7 @@ use ts_sim::defs::{
 };
 use ts_sim::events::GameEvent;
 use ts_sim::map::{DecorKind, GeneratedWorld, Map};
-use ts_sim::slab::{BuildingId, NodeId, PointId, SheepId};
+use ts_sim::slab::{NodeId, PointId, SheepId};
 use ts_sim::snapshot_types::{BuildingView, UF_FLIP, UF_HURT, UF_INSIDE};
 use ts_sim::world::SheepState;
 
@@ -297,6 +297,8 @@ pub struct Scenery {
     ch: i32,
     /// pond centres (px) for duck radii
     ponds: Vec<Vec2>,
+    /// decor indices of the rubber ducks (drawn every frame on the dynamic layer)
+    ducks: Vec<u32>,
     /// static light sources (campfire / shrine props): world pos, radius px, power, seed, flicker
     lights: Vec<(Vec2, f32, f32, f32, f32)>,
 }
@@ -308,6 +310,7 @@ impl Scenery {
         self.points.clear();
         self.items.clear();
         self.lights.clear();
+        self.ducks.clear();
         let map = &g.map;
         let center = |c: i32| {
             let p = map.center(c);
@@ -385,7 +388,11 @@ impl Scenery {
         }
         for (i, d) in map.decor.iter().enumerate() {
             match d.kind {
-                DecorKind::Duck | DecorKind::Cloud => continue,
+                DecorKind::Duck => {
+                    self.ducks.push(i as u32);
+                    continue;
+                }
+                DecorKind::Cloud => continue,
                 DecorKind::Prop(PropKind::Campfire) => {
                     self.lights.push((Vec2::new(d.x, d.y), 290.0, 1.25, d.x, 0.35))
                 }
@@ -783,13 +790,11 @@ fn draw_node(
                 if sh == NONE {
                     return;
                 }
-                let s = *p.atlas.sheet(sh);
                 let f = *p.atlas.frame(sh, (t * 8.0 + n.phase as f64).floor() as i64);
                 p.frame(Layer::Static, Flavor::Lit, &f, 96.0, TREE_DEF[v].0 as f32, foot, SpriteOpts {
                     color: tint,
                     ..default()
                 });
-                let _ = s;
             } else {
                 let sh = sheets.stumps[v];
                 if sh == NONE {
@@ -806,10 +811,6 @@ fn draw_node(
             if n.big {
                 let sh = sheets.gold_big;
                 if sh != NONE {
-                    p.sprite(Layer::Static, flavor, sh, 0, foot, SpriteOpts {
-                        color,
-                        ..default()
-                    });
                     bottom_centre(p, sh, foot, flavor, color);
                 }
                 return;
@@ -1466,7 +1467,7 @@ fn draw_misc(
         );
     }
     // ---- ducks ----
-    for d in map.decor.iter().filter(|d| d.kind == DecorKind::Duck) {
+    for d in scenery.ducks.iter().filter_map(|&i| map.decor.get(i as usize)) {
         if !basis.in_view(d.x, d.y, 100.0) || !fog.knows(d.x, d.y) {
             continue;
         }
@@ -1504,6 +1505,4 @@ fn draw_misc(
             draw_prop(&mut p, &sheets, Layer::Dynamic, k, foot, fog.tint(x, y));
         }
     }
-    let _ = ground_at;
-    let _: Option<BuildingId> = None;
 }

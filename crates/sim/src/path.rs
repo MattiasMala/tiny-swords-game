@@ -626,8 +626,9 @@ mod tests {
         assert_eq!(f[m.idx(4, 0) as usize], FIELD_INF);
         let n = step_from(&m, &f, m.idx(6, 0), 0, false);
         assert!(n >= 0 && f[n as usize] < f[m.idx(6, 0) as usize]);
-        // around the wall: (5,0) is reached through the gap at (4,7)
-        assert_eq!(f[m.idx(5, 0) as usize], 4 * 14 + 2 * 10 + 3 * 14);
+        // around the wall: (5,0) is reached through the gap at (4,7), entered and left orthogonally (no corner
+        // cutting past the wall's end): (0,0) -3 diag-> (3,3) -4-> (3,7) -> (4,7) -> (5,7) -7-> (5,0)
+        assert_eq!(f[m.idx(5, 0) as usize], 3 * 14 + 4 * 10 + 2 * 10 + 7 * 10);
     }
 
     #[test]

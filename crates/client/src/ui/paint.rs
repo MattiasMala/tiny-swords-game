@@ -390,6 +390,9 @@ impl Paint {
     /// `dim(ctx, a)`: full-screen `rgba(16,20,36,a)` + hot.
     pub fn dim(&mut self, a: f32) {
         let (w, h) = (self.io.w, self.io.h);
+        // the canvas blends in sRGB, bevy_ui in linear space: a dark veil of alpha `a` darkens a light background
+        // like the canvas one when its alpha is `1 - (1 - a)^2.2`
+        let a = 1.0 - (1.0 - a.clamp(0.0, 1.0)).powf(2.2);
         self.rect(0.0, 0.0, w, h, Color::srgba(16.0 / 255.0, 20.0 / 255.0, 36.0 / 255.0, a));
         self.hot_acc = true;
     }
@@ -510,15 +513,17 @@ pub struct Pool {
     pub font: Handle<Font>,
 }
 
-/// Width of the box used to centre / right-align a label.
-const ALIGN_BOX: f32 = 4000.0;
+/// Node position of a label (`left`, `top`); centring / right alignment is a percentage translation of the
+/// auto-sized node (`align_shift`).
+fn txt_node(x: f32, y: f32, size: f32) -> (f32, f32) {
+    (x.round(), (y - size * 0.62).round())
+}
 
-fn txt_node(x: f32, y: f32, size: f32, align: Align) -> (f32, f32, Val) {
-    let top = (y - size * 0.62).round();
-    match align {
-        Align::Left => (x.round(), top, Val::Auto),
-        Align::Center => ((x - ALIGN_BOX / 2.0).round(), top, px(ALIGN_BOX)),
-        Align::Right => ((x - ALIGN_BOX).round(), top, px(ALIGN_BOX)),
+fn align_shift(a: Align) -> Val2 {
+    match a {
+        Align::Left => Val2::ZERO,
+        Align::Center => Val2::percent(-50.0, 0.0),
+        Align::Right => Val2::percent(-100.0, 0.0),
     }
 }
 
@@ -531,7 +536,7 @@ fn justify(a: Align) -> Justify {
 }
 
 fn text_bundle(font: &Handle<Font>, st: &TxtState) -> impl Bundle {
-    let (l, t, w) = txt_node(st.pos[0], st.pos[1], st.size, st.align);
+    let (l, t) = txt_node(st.pos[0], st.pos[1], st.size);
     (
         TxtSlot {
             state: Some(st.clone()),
@@ -541,9 +546,9 @@ fn text_bundle(font: &Handle<Font>, st: &TxtState) -> impl Bundle {
             position_type: PositionType::Absolute,
             left: px(l),
             top: px(t),
-            width: w,
             ..default()
         },
+        UiTransform::from_translation(align_shift(st.align)),
         Text::new(st.s.clone()),
         TextFont {
             font: font.clone().into(),
@@ -614,6 +619,7 @@ type TxtQ<'w, 's> = Query<
         &'static mut TextLayout,
         &'static mut GlobalZIndex,
         Option<&'static mut TextShadow>,
+        &'static mut UiTransform,
     ),
     Without<ImgSlot>,
 >;
@@ -624,7 +630,7 @@ fn apply_txt(
     st: TxtState,
     q: &mut TxtQ,
 ) -> bool {
-    let Ok((mut slot, mut node, mut text, mut font, mut color, mut layout, mut z, shadow)) =
+    let Ok((mut slot, mut node, mut text, mut font, mut color, mut layout, mut z, shadow, mut tf)) =
         q.get_mut(e)
     else {
         return false;
@@ -641,16 +647,16 @@ fn apply_txt(
         text.0.clone_from(&st.s);
     }
     if old.as_ref().map(|o| (o.pos, o.size, o.align)) != Some((st.pos, st.size, st.align)) {
-        let (l, t, w) = txt_node(st.pos[0], st.pos[1], st.size, st.align);
+        let (l, t) = txt_node(st.pos[0], st.pos[1], st.size);
         node.left = px(l);
         node.top = px(t);
-        node.width = w;
     }
     if old.as_ref().map(|o| o.size) != Some(st.size) {
         font.font_size = FontSize::Px(st.size);
     }
     if old.as_ref().map(|o| o.align) != Some(st.align) {
         layout.justify = justify(st.align);
+        tf.translation = align_shift(st.align);
     }
     if old.as_ref().map(|o| o.color) != Some(st.color) {
         color.0 = st.color;
@@ -673,10 +679,14 @@ pub fn sync_pool(
     mut commands: Commands,
     paint: Res<Paint>,
     mut pool: ResMut<Pool>,
+    ga: Res<GameAssets>,
     mut imgs: ImgQ,
     mut txts: TxtQ,
 ) {
     let (mut ni, mut nt, mut ns) = (0usize, 0usize, 0usize);
+    if pool.font.id() != ga.font.id() {
+        pool.font = ga.font.clone();
+    }
     let font = pool.font.clone();
     for (i, p) in paint.prims.iter().enumerate() {
         let z = Z_BASE + i as i32;

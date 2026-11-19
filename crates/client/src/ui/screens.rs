@@ -86,7 +86,7 @@ fn manage_frame(u: &mut Ui, st: &mut UiState, v: &View, title: &str, w0: f32, h0
     let close = u
         .tiny_button(x + w - 36.0 * s, y + 34.0 * s, 40.0 * s, false, true, Some(9))
         .clicked;
-    if close || (!st.fresh && u.p.io.pressed && !u.p.over(x, y, w, h)) {
+    if close || (!st.fresh && !u.p.locked && u.p.io.pressed && !u.p.over(x, y, w, h)) {
         st.screen = None;
     }
     st.fresh = false;
@@ -595,6 +595,8 @@ fn draw_send(u: &mut Ui, st: &mut UiState, env: &mut Env, v: &View) {
         y: t.y.round(),
         target: None,
     });
+    env.marks
+        .mark(crate::control::MarkKind::Attack, Vec2::new(t.x.round(), t.y.round()));
     u.play(Sound::Ack);
     st.toast(format!("{} unità in marcia", units.len()));
     st.screen = None;

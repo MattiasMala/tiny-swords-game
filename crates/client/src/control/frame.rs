@@ -44,7 +44,8 @@ pub struct FrameInput {
     pub generation: Option<u32>,
 }
 
-/// M (audio), F2 (lights), F3 (resolution): always, in every state (05 §5.1).
+/// M (audio), F2 (lights), F3 (resolution): always, in every state (05 §5.1). The renderers follow
+/// `GraphicsQuality` (C1's `render::light` mirrors `lights` into its `LightState`).
 pub fn global_keys(
     mut kev: MessageReader<KeyboardInput>,
     mut audio: ResMut<AudioSettings>,
@@ -215,6 +216,14 @@ pub fn control_frame(
         hits.push(k.key_code);
     }
 
+    // wheel: read every frame (stale notches must not zoom after an overlay closes); one step per frame, sign
+    // only, horizontal-only scrolls (`y == 0`) ignored (`f32::signum(0.0)` is 1)
+    let w_sum: f32 = wheel
+        .read()
+        .filter(|e| e.y != 0.0 && e.y.is_finite())
+        .map(|e| e.y.signum())
+        .sum();
+
     ctx.refresh();
     // markers age with the presentation clock; frozen while the solo game is paused
     let solo_frozen = ctx.solo() && (ctx.ui.paused || ctx.ui.help);
@@ -370,7 +379,6 @@ pub fn control_frame(
         ctx.rig.focus = f;
         ctx.rig.clamp();
     }
-    let w_sum: f32 = wheel.read().map(|e| e.y.signum()).sum();
     if w_sum != 0.0 && free && !screen_open {
         // one step per frame, wheel up = zoom in, around the mouse
         ctx.rig.zoom_step(if w_sum > 0.0 { 1 } else { -1 }, fi.mouse_ground);
@@ -455,7 +463,8 @@ pub fn control_frame(
         && released
     {
         fi.drag = None;
-        let m = cursor.unwrap_or(d);
+        // released outside the window: the last known cursor position (JS keeps `Input.mouse`)
+        let m = cursor.or(fi.last_mouse).unwrap_or(d);
         if m.distance(d) > DRAG_MIN {
             ctx.box_select(d, m, shift);
         } else {
@@ -499,8 +508,8 @@ fn place_step(
         let p = if click { fi.down_ground } else { fi.mouse_ground };
         if let Some(p) = p {
             ctx.place.cell = IVec2::new(
-                (p.x / TILE - d.w as f32 / 2.0).round() as i32,
-                (p.y / TILE - d.h as f32 / 2.0).round() as i32,
+                super::ctx::js_round(p.x / TILE - d.w as f32 / 2.0),
+                super::ctx::js_round(p.y / TILE - d.h as f32 / 2.0),
             );
         }
     }

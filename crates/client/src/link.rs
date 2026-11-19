@@ -588,7 +588,10 @@ fn pump(
                     } else {
                         mirror.init(seed, setup, colors, you, rejoin, map_hash);
                     }
-                    next.set(AppState::InGame);
+                    // already InGame (reconnect into the running match): a plain `set` would run OnExit/OnEnter
+                    // (DespawnOnExit terrain/water, selection reset) after the renderers already rebuilt for the
+                    // new mirror generation → empty world; they follow `Mirror::generation` instead
+                    next.set_if_different(AppState::InGame);
                 }
                 ServerMsg::Snapshot(s) => {
                     if mirror.active {

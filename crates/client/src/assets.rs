@@ -916,14 +916,19 @@ fn track_loading(
     }
     let mut loaded = 0;
     let mut failed = 0;
-    for h in ga
+    let mut first_failed: Option<usize> = None;
+    for (i, h) in ga
         .images
         .iter()
-        .filter(|h| *h != &Handle::<Image>::default())
+        .enumerate()
+        .filter(|(_, h)| *h != &Handle::<Image>::default())
     {
         match server.load_state(h.id()) {
             LoadState::Loaded => loaded += 1,
-            LoadState::Failed(_) => failed += 1,
+            LoadState::Failed(_) => {
+                failed += 1;
+                first_failed.get_or_insert(i);
+            }
             _ => {}
         }
     }
@@ -933,8 +938,20 @@ fn track_loading(
     ga.loaded = loaded;
     ga.failed = failed;
     let done = loaded + failed;
+    // a missing sprite stops the loading like the 2D game (`renderLoading` shows `G.error`, spec 07 §8.2)
+    let error = first_failed
+        .and_then(|i| ga.manifest.get(i))
+        .map(|e| format!("Impossibile caricare assets/{}", e.rel()));
     for mut t in &mut text {
-        t.0 = format!("Caricamento sprite {}/{}", done, ga.total);
+        let s = error
+            .clone()
+            .unwrap_or_else(|| format!("Caricamento sprite {}/{}", done, ga.total));
+        if t.0 != s {
+            t.0 = s;
+        }
+    }
+    if error.is_some() {
+        return;
     }
     for mut n in &mut bar {
         n.width = percent(100.0 * done as f32 / ga.total.max(1) as f32);

@@ -284,7 +284,7 @@ pub fn pick_hits(
     if hits.hits.is_empty() {
         return None;
     }
-    let mut best: Option<(u8, f32, EntityRef)> = None;
+    let mut best: Option<(u16, f32, EntityRef)> = None;
     for h in &hits.hits {
         if h.priority > prio::TREE || !h.screen_rect.contains(s) {
             continue;
@@ -314,14 +314,21 @@ pub fn pick_hits(
             continue;
         }
         let front_most = matches!(h.priority, p if p == prio::UNIT || p == prio::BUILDING || p == prio::TREE);
+        // class rank: the deposits class is "gold, then stone" (05 §7.2 step 5)
+        let rank = h.priority as u16 * 2
+            + match e {
+                EntityRef::Node(n) => scene
+                    .nodes
+                    .get(n.0 as usize)
+                    .is_some_and(|n| n.kind == NodeKind::Stone) as u16,
+                _ => 0,
+            };
         let better = match best {
             None => true,
-            Some((bp, by, _)) => {
-                h.priority < bp || (h.priority == bp && front_most && h.foot.y > by)
-            }
+            Some((bp, by, _)) => rank < bp || (rank == bp && front_most && h.foot.y > by),
         };
         if better {
-            best = Some((h.priority, h.foot.y, e));
+            best = Some((rank, h.foot.y, e));
         }
     }
     Some(best.map(|(_, _, e)| e))

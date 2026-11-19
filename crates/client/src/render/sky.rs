@@ -39,6 +39,11 @@ pub fn day_ambient(phase: f32) -> ([f32; 3], f32) {
     (amb, night)
 }
 
+/// Distance fog: linear from `FOG_START` to `FOG_END` × the camera distance, at most `FOG_ALPHA` opaque.
+const FOG_START: f32 = 1.0;
+const FOG_END: f32 = 3.6;
+const FOG_ALPHA: f32 = 0.5;
+
 pub struct SkyPlugin;
 
 impl Plugin for SkyPlugin {
@@ -62,12 +67,12 @@ fn update_fog(
     let night_c = Vec3::new(0.10, 0.12, 0.24);
     let c = day_c.lerp(night_c, night * 0.85);
     let fog = DistanceFog {
-        color: Color::srgba(c.x, c.y, c.z, 0.6),
+        color: Color::srgba(c.x, c.y, c.z, FOG_ALPHA),
         directional_light_color: Color::srgba(1.0, 0.92, 0.78, 0.25 * (1.0 - night)),
         directional_light_exponent: 24.0,
         falloff: FogFalloff::Linear {
-            start: d * 0.95,
-            end: d * 3.4,
+            start: d * FOG_START,
+            end: d * FOG_END,
         },
     };
     for (e, f) in &mut cams {
@@ -75,7 +80,7 @@ fn update_fog(
             Some(mut f) => {
                 if f.color != fog.color
                     || f.directional_light_color != fog.directional_light_color
-                    || !matches!(f.falloff, FogFalloff::Linear { start, end } if (start - d * 0.95).abs() < 1e-3 && (end - d * 3.4).abs() < 1e-3)
+                    || !matches!(f.falloff, FogFalloff::Linear { start, end } if (start - d * FOG_START).abs() < 1e-3 && (end - d * FOG_END).abs() < 1e-3)
                 {
                     *f = fog.clone();
                 }

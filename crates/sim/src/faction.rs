@@ -116,22 +116,28 @@ impl World {
 
     /// `canAfford(f, cost)`.
     pub fn can_afford(&self, f: FactionIdx, c: &Cost) -> bool {
-        self.factions[f as usize].res.can_afford(c)
+        self.factions.get(f as usize).is_some_and(|fac| fac.res.can_afford(c))
     }
 
     /// `pay(f, cost)` (no check).
     pub fn pay(&mut self, f: FactionIdx, c: &Cost) {
-        self.factions[f as usize].res.pay(c);
+        if let Some(fac) = self.factions.get_mut(f as usize) {
+            fac.res.pay(c);
+        }
     }
 
     /// `refund(f, cost)`.
     pub fn refund(&mut self, f: FactionIdx, c: &Cost) {
-        self.factions[f as usize].res.refund(c);
+        if let Some(fac) = self.factions.get_mut(f as usize) {
+            fac.res.refund(c);
+        }
     }
 
     /// `roomFor(f, type)`: pawns need `pawn_n < pawn_cap`; every other kind (scout included) is a troop.
     pub fn room_for(&self, f: FactionIdx, k: UnitKind) -> bool {
-        let fac = &self.factions[f as usize];
+        let Some(fac) = self.factions.get(f as usize) else {
+            return false;
+        };
         if k == UnitKind::Pawn {
             fac.pawn_n < fac.pawn_cap
         } else {
@@ -141,7 +147,7 @@ impl World {
 
     /// Training speed of a building kind for `f` (`trainSpeed(f.has[kind] || 1)`).
     pub fn train_speed_of(&self, f: FactionIdx, k: BuildingKind) -> f32 {
-        train_speed(self.factions[f as usize].has[k as usize] as u32)
+        train_speed(self.factions.get(f as usize).map_or(0, |fac| fac.has[k as usize]) as u32)
     }
 
     /// `applyTech(f, id)` (04a §6.2): mark researched (and no longer busy); age techs → `age`, banner
@@ -332,12 +338,12 @@ impl World {
 
     /// `sellPrice(f, res)`: gold received for 100 units (fractional).
     pub fn sell_price_of(&self, f: FactionIdx, r: Res) -> f64 {
-        sell_price(self.factions[f as usize].trades[r as usize])
+        sell_price(self.factions.get(f as usize).map_or(0.0, |fac| fac.trades[r as usize]))
     }
 
     /// `buyPrice(f, res)`: gold paid for 100 units (fractional).
     pub fn buy_price_of(&self, f: FactionIdx, r: Res) -> f64 {
-        buy_price(self.factions[f as usize].trades[r as usize])
+        buy_price(self.factions.get(f as usize).map_or(0.0, |fac| fac.trades[r as usize]))
     }
 
     /// Market trade (04a §8, factions.js:408-420): the caller checked the market (own, done) and the resource
@@ -347,7 +353,9 @@ impl World {
         if !r.tradable() {
             return Ok(());
         }
-        let fac = &mut self.factions[f as usize];
+        let Some(fac) = self.factions.get_mut(f as usize) else {
+            return Ok(());
+        };
         let ri = r as usize;
         match op {
             TradeOp::Sell => {

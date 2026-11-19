@@ -97,6 +97,23 @@ impl World {
         .unwrap_or(p.from)
     }
 
+    /// True if a building may contain the arrow point `at` in its hit box (`x0 < x < x1 && y0 - 70 < y < y1`).
+    /// Building rects are their cell footprints, so such a building owns a cell of column `floor(x/64)` in rows
+    /// `floor(y/64) ..= floor((y+70)/64)`. Pure optimisation: the exact JS scan still decides (and its order).
+    fn building_cells_under(&self, at: V2) -> bool {
+        let m = &self.map;
+        if !at.x.is_finite() || !at.y.is_finite() {
+            return false;
+        }
+        let cx = (at.x / crate::TILE).floor() as i32;
+        if cx < 0 || cx >= m.w {
+            return false;
+        }
+        let r0 = ((at.y / crate::TILE).floor() as i32).max(0);
+        let r1 = (((at.y + ARROW_BUILDING_TOP) / crate::TILE).floor() as i32).min(m.h - 1);
+        (r0..=r1).any(|r| m.own_of.get((r * m.w + cx) as usize).is_some_and(|s| *s != 0))
+    }
+
     fn proj_source(p: &Projectile) -> DamageSource {
         DamageSource {
             unit: match p.shooter {
@@ -179,6 +196,11 @@ impl World {
                         if let Some(p) = self.projectiles.get_mut(pid) {
                             p.dead = true;
                         }
+                        continue;
+                    }
+                    // cheap pre-check: a building can only contain the arrow (x0<x<x1, y0-70<y<y1) if one of
+                    // the cells of column x between rows y and y+70 belongs to some building
+                    if !self.building_cells_under(at) {
                         continue;
                     }
                     let bhit = self.buildings.iter().find_map(|(bid, b)| {

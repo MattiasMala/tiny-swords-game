@@ -16,6 +16,7 @@
 use crate::AppState;
 use crate::control::view::ViewInfo;
 use crate::link::GameEventMsg;
+use crate::mirror::Mirror;
 use bevy::audio::{PlaybackMode, Volume};
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseButtonInput;
@@ -162,10 +163,20 @@ fn unlock_on_gesture(
 fn sim_sounds(
     mut events: MessageReader<GameEventMsg>,
     mut out: MessageWriter<PlaySfx>,
+    view: Res<ViewInfo>,
+    mirror: Res<Mirror>,
 ) {
     for GameEventMsg(e) in events.read() {
         match e {
             GameEvent::Sound { sound, x, y } => {
+                // 07 addenda L1: the JS gated `chop` with `onScreen(x, y, 80)`; the sim always emits it, the client culls
+                if *sound == Sound::Chop {
+                    let map = mirror.map();
+                    let k = view.scale_at(map, *x, *y) / ts_sim::TILE;
+                    if !view.on_screen(map, *x, *y, 80.0 * k) {
+                        continue;
+                    }
+                }
                 out.write(PlaySfx::at(*sound, *x, *y));
             }
             // private: the room routes it only to its recipient; the UI also emits its sounds this way

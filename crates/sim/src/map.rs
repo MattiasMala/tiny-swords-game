@@ -461,7 +461,11 @@ impl Map {
     /// `clearLine(x0, y0, x1, y1, side)` (02 §3.2 + addenda W1: cross = true, own buildings crossable).
     pub fn clear_line(&self, a: V2, b: V2, side: u8) -> bool {
         let d = a.dist(b);
-        let n = (d / 24.0).ceil() as i32;
+        if !d.is_finite() {
+            return false; // NaN / infinite positions: never a clear line (and no unbounded loop)
+        }
+        // a line can never be longer than the map diagonal (~22 200 px → ~925 samples)
+        let n = ((d / 24.0).ceil() as i32).min(2048);
         let (mut px, mut py) = (a.x, a.y);
         for i in 1..=n {
             let t = i as f32 / n as f32;

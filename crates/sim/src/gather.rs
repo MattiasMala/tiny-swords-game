@@ -1257,6 +1257,83 @@ pub(crate) mod tests {
             Order::Shelter { building, .. } if building == castle));
     }
 
+    /// Addenda G6: a pawn sent from its gathering to an unreachable site (on the island) goes back to gathering.
+    /// An unreachable shelter (house on the island) makes a frightened pawn brave instead.
+    #[test]
+    fn unreachable_site_and_shelter() {
+        let mut w = test_world();
+        let site = w.add_building(0, BuildingKind::House, 50, 61, false);
+        let shelter = w.add_building(0, BuildingKind::House, 51, 62, true);
+        w.census(0);
+        let t = tree(&w, 30, 26);
+        let u = spawn(&mut w, 0, UnitKind::Pawn, 30, 28);
+        let Some(Order::Gather(g)) = w.gather_order(t) else {
+            unreachable!()
+        };
+        w.set_order(
+            u,
+            Order::Build {
+                building: site,
+                resume: Some(g),
+            },
+        );
+        run(&mut w, 0.2);
+        assert!(
+            matches!(w.units.get(u).unwrap().order, Order::Gather(o) if o.first.is_none() && o.res == Res::Wood),
+            "resumes its gathering: {:?}",
+            w.units.get(u).unwrap().order
+        );
+        // a pawn on the shore next to the island house, an enemy warrior on the shore too
+        let p = spawn(&mut w, 0, UnitKind::Pawn, 50, 56);
+        spawn(&mut w, 1, UnitKind::Warrior, 53, 54);
+        run(&mut w, 0.6);
+        let pu = w.units.get(p).unwrap();
+        assert!(pu.inside != Some(shelter));
+        assert!(
+            pu.brave || matches!(pu.order, Order::Shelter { building, .. } if building != Some(shelter)),
+            "no reachable house: brave or another shelter, got {:?}",
+            pu.order
+        );
+    }
+
+    /// Drop order delivers then idles; a relocated house carries its occupants; rally on a site → new pawns build.
+    #[test]
+    fn drop_relocate_and_rally_site() {
+        let mut w = test_world();
+        let depot = w.add_building(0, BuildingKind::Depot, 30, 40, true);
+        w.census(0);
+        let u = spawn(&mut w, 0, UnitKind::Pawn, 34, 40);
+        w.units.get_mut(u).unwrap().carry = Some(Carry {
+            res: Res::Stone,
+            amount: 10.0,
+        });
+        let s0 = w.factions[0].res[Res::Stone];
+        w.set_order(u, Order::Drop { building: depot });
+        run(&mut w, 3.0);
+        assert_eq!(w.factions[0].res[Res::Stone], s0 + 10.0);
+        assert!(matches!(w.units.get(u).unwrap().order, Order::Idle { .. }));
+        // occupants follow a moved house
+        let house = w.add_building(0, BuildingKind::House, 40, 40, true);
+        w.census(0);
+        let p = spawn(&mut w, 0, UnitKind::Pawn, 42, 41);
+        w.enter_shelter(p, house);
+        w.relocate_building(house, 44, 46);
+        let c = w.buildings.get(house).unwrap().rect.center();
+        assert_eq!(w.units.get(p).unwrap().pos, c);
+        assert!(!w.map.passable(w.map.idx(44, 46), 0));
+        assert!(w.map.passable(w.map.idx(40, 40), 0));
+        // rally on an own site: trained pawns go build it
+        let castle = w.factions[0].castle.unwrap();
+        let site = w.add_building(0, BuildingKind::Farm, 30, 50, false);
+        w.buildings.get_mut(castle).unwrap().rally.target =
+            Some(crate::world::RallyTarget::Building(site));
+        let np = w.deploy(castle, UnitKind::Pawn).unwrap();
+        assert!(matches!(
+            w.units.get(np).unwrap().order,
+            Order::Build { building, resume: None } if building == site
+        ));
+    }
+
     #[test]
     fn pickups_go_to_first_unit() {
         let mut w = test_world();
@@ -1413,6 +1490,56 @@ pub(crate) mod tests {
         }
         for fac in &w.factions {
             assert!(fac.gathered > 0.0);
+        }
+    }
+
+    /// Several seeds, 5 AI kingdoms, 12 game minutes: booking counters (`users`) always match the pawns booked
+    /// on each node/sheep, nobody shelters in a dead or full house, buildings get finished.
+    /// `cargo test -p ts-sim --release economy_invariants -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn economy_invariants_many_seeds() {
+        for seed in [1u32, 5, 9, 23] {
+            let mut w = World::new(seed, &MatchSetup::default());
+            for tick in 0..(720.0 / TICK_DT) as usize {
+                w.step(&[]);
+                w.events.clear();
+                if tick % 200 != 0 {
+                    continue;
+                }
+                for (i, n) in w.nodes.iter().enumerate() {
+                    let g = GatherTarget::Node(NodeId(i as u32));
+                    let booked = w.units.values().filter(|u| !u.dead && u.node == Some(g)).count();
+                    assert_eq!(n.users as usize, booked, "seed {seed} tick {tick} node {i}");
+                    assert!(n.amount >= 0.0 && n.amount <= n.max.max(TREE_WOOD));
+                }
+                for (sid, s) in w.sheep.iter() {
+                    let g = GatherTarget::Sheep(sid);
+                    let booked = w.units.values().filter(|u| !u.dead && u.node == Some(g)).count();
+                    assert_eq!(s.users as usize, booked, "seed {seed} tick {tick} sheep");
+                }
+                for (bid, b) in w.buildings.iter() {
+                    assert!(b.hp.is_finite() && b.progress.is_finite());
+                    assert!(b.kind == BuildingKind::Castle || b.inside.len() <= SHELTER_CAP + 1);
+                    for u in &b.inside {
+                        assert_eq!(w.units.get(*u).and_then(|u| u.inside), Some(bid));
+                    }
+                }
+                for (uid, u) in w.units.iter() {
+                    assert!(u.pos.x.is_finite() && u.pos.y.is_finite());
+                    if let Some(b) = u.inside {
+                        assert!(w.buildings.get(b).is_some_and(|b| !b.dead && b.inside.contains(&uid)));
+                    }
+                }
+            }
+            let done = w.buildings.values().filter(|b| b.done && b.kind != BuildingKind::Castle).count();
+            eprintln!(
+                "seed {seed}: units {}, buildings done {done}, sheep {}, gathered {:?}",
+                w.units.len(),
+                w.sheep.len(),
+                w.factions.iter().map(|f| f.gathered as i64).collect::<Vec<_>>()
+            );
+            assert!(done > 0);
         }
     }
 

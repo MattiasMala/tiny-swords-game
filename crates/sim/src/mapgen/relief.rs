@@ -1,9 +1,17 @@
 //! Plateaus (level 1), terraces (level 2), cliffs and stairs — 02 §5.8 semantics, MAPGEN.md §1, §2, §4 shapes.
 //!
-//! Each plateau is a union of 1-4 axis-aligned rectangles (edges often aligned so outlines have long runs),
-//! clipped to the allowed area, then closed + opened with a 3x3 square (no one-cell spurs, notches or holes) and
-//! reduced to its largest component. Plateaus keep ≥ 4 cells from each other and stay out of the kingdoms' keep
-//! zones. Some are anchored on a straight stretch of coast so their cliff drops straight into the sea.
+//! Area-driven: plateaus are added until about 27-33 % of the mainland is raised (20-38 of them): first 5-8
+//! massifs (a wide core + 3-5 lobes), then big and medium ones. Each plateau is a union of axis-aligned rectangles
+//! (edges often aligned so outlines have long runs), clipped to the allowed area, then closed + opened with a 3x3
+//! square (no one-cell spurs, notches or holes) and reduced to its largest component. Plateaus keep ≥ 4 cells from
+//! each other (lowland corridors between them) and stay out of the kingdoms' keep zones. Some are anchored on a
+//! straight stretch of coast so their cliff drops straight into the sea. A candidate that would split the lowland
+//! (a cheap local ring test, else a global flood) is rejected, and a stair whose raised top would cut a one-cell
+//! neck of the lower ground is skipped (`bridge_ok`), so access never depends on luck.
+//!
+//! Terraces (level 2): on plateaus ≥ 110 cells, 1-2 rectangles (2-3 larger ones on plateaus ≥ 400 cells) inside
+//! the plateau's 2-cell inner margin (3 below), with 1-2 stairs from level-1 ground reachable from the plateau's own
+//! stairs.
 //!
 //! Gameplay semantics (02 §3.1, §5.8) are kept exactly: the cell south of every bottom-edge cell is a `cliff`;
 //! a stair is the 2-cell column `hi`/`lo` beside a bottom corner (`stairSpots`), `hi` gets the upper level; the
@@ -39,8 +47,6 @@ pub struct Hill {
     pub top: Option<(Vec<i32>, Vec<Stair>)>,
     /// resource anchor: free level-1 cell nearest to the centroid
     pub anchor: (i32, i32),
-    /// cliff dropping into the sea on part of its south edge
-    pub cape: bool,
 }
 
 impl Hill {
@@ -70,22 +76,28 @@ impl Gen {
         }
     }
 
-    /// Random rectangle union around an anchor, rasterised into a local window `(x0, y0, mask)`.
-    fn rect_union(&mut self, ax: i32, ay: i32, cape: bool, big: bool) -> (i32, i32, Mask) {
+    /// Random rectangle union around an anchor, rasterised into a local window `(x0, y0, mask)`. `tier`: 0 = massif
+    /// (a wide core + 2-4 lobes), 1 = big plateau, 2 = medium plateau.
+    fn rect_union(&mut self, ax: i32, ay: i32, cape: bool, tier: u8) -> (i32, i32, Mask) {
         let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
-        let (w0, h0) = if big {
-            (15 + self.below(12), 8 + self.below(6))
-        } else {
-            (9 + self.below(10), 5 + self.below(6))
+        let (w0, h0) = match tier {
+            0 => (26 + self.below(16), 12 + self.below(8)),
+            1 => (17 + self.below(13), 9 + self.below(6)),
+            _ => (9 + self.below(10), 5 + self.below(6)),
         };
         let x0 = ax - self.below(w0 as u32);
         let y0 = if cape { ay - h0 + 1 } else { ay - self.below(h0 as u32) };
         rects.push((x0, y0, w0, h0));
-        let extra = [0, 1, 1, 2, 2, 3][self.below(6) as usize] + big as i32;
+        let extra = match tier {
+            0 => 3 + self.below(3),
+            1 => [1, 2, 2, 3][self.below(4) as usize],
+            _ => [0, 1, 1, 2][self.below(4) as usize],
+        };
+        let (lw, lh) = if tier == 0 { (8, 5) } else { (5, 4) };
         for _ in 0..extra {
             let r = rects[self.below(rects.len() as u32) as usize];
-            let w = 5 + self.below(11);
-            let h = 4 + self.below(6);
+            let w = lw + self.below(11);
+            let h = lh + self.below(6);
             // attach on one side with an overlap of ≥ 2 cells; often align an edge with the parent
             let (x, y) = match self.below(4) {
                 0 => {
@@ -193,6 +205,10 @@ impl Gen {
                 }
             }
             let s = spots.remove(pick);
+            if !self.bridge_ok(s.hi, s.lo, level - 1) {
+                // raising `hi` would cut a one-cell neck of the lower ground
+                continue;
+            }
             let i_lo = s.lo as usize;
             let i_hi = s.hi as usize;
             self.map.stair[i_lo] = if s.dir < 0 { 1 } else { 3 };
@@ -222,6 +238,46 @@ impl Gen {
         put
     }
 
+    /// Raising the stair top `hi` keeps the lower ground around it connected: every walkable 4-neighbour of `hi` on
+    /// level `low` is reached from `lo` inside a 9x9 window without `hi` (sufficient local test).
+    fn bridge_ok(&self, hi: i32, lo: i32, low: u8) -> bool {
+        let (hx, hy) = (hi % W, hi / W);
+        const R: i32 = 4;
+        const S: i32 = 2 * R + 1;
+        let walk = |x: i32, y: i32| -> bool {
+            if !self.map.inside(x, y) || (x == hx && y == hy) {
+                return false;
+            }
+            let k = idx(x, y) as usize;
+            self.map.land[k] == 1 && self.map.cliff[k] == 0 && self.map.level[k] == low
+        };
+        let mut seen = [false; (S * S) as usize];
+        let mut stack: Vec<(i32, i32)> = Vec::with_capacity(32);
+        let (lx, ly) = (lo % W, lo / W);
+        if !walk(lx, ly) {
+            return true;
+        }
+        seen[((ly - hy + R) * S + (lx - hx + R)) as usize] = true;
+        stack.push((lx, ly));
+        while let Some((x, y)) = stack.pop() {
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, ny) = (x + dx, y + dy);
+                if (nx - hx).abs() > R || (ny - hy).abs() > R || !walk(nx, ny) {
+                    continue;
+                }
+                let i = ((ny - hy + R) * S + (nx - hx + R)) as usize;
+                if !seen[i] {
+                    seen[i] = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().all(|(dx, dy)| {
+            let (nx, ny) = (hx + dx, hy + dy);
+            !walk(nx, ny) || seen[((ny - hy + R) * S + (nx - hx + R)) as usize]
+        })
+    }
+
     /// Straight coast cells (land with sea below, 3 in a row): anchors of capes.
     fn cape_cells(&self) -> Vec<i32> {
         let mut out = Vec::new();
@@ -242,12 +298,26 @@ impl Gen {
     pub fn relief(&mut self) -> bool {
         self.keep_zones();
         let land_cells = self.map.land.iter().filter(|v| **v == 1).count();
-        let want = ((land_cells as f64 / 1000.0) * (0.85 + self.rnd() * 0.35)).round().clamp(18.0, 40.0) as usize;
+        // area-driven: about a quarter of the mainland raised (JS: ~9 700 level-1 cells), in 20-38 plateaus,
+        // a few massifs first, then big and medium ones
+        let target = (land_cells as f64 * (0.27 + self.rnd() * 0.06)) as usize;
+        let massifs = 5 + self.below(4) as usize;
         let capes = self.cape_cells();
+        let b0 = idx(self.bases[0].0, self.bases[0].1 + 2);
+        let lowland = |map: &crate::map::Map, k: usize| map.land[k] == 1 && map.level[k] == 0 && map.cliff[k] == 0;
+        let mut reach = flood4(W, H, &[b0], |k| lowland(&self.map, k)).iter().filter(|v| **v != 0).count();
         let mut hills: Vec<Hill> = Vec::new();
+        let mut area = 0usize;
         let mut t = 0;
-        while hills.len() < want && t < 3000 {
+        while (area < target || hills.len() < 20) && hills.len() < 38 && t < 4000 {
             t += 1;
+            let tier = if hills.len() < massifs && t < 1500 {
+                0
+            } else if area < target * 3 / 4 {
+                1
+            } else {
+                2
+            };
             let cape = !capes.is_empty() && self.chance(0.3);
             let (ax, ay) = if cape {
                 let c = capes[self.below(capes.len() as u32) as usize];
@@ -258,8 +328,7 @@ impl Gen {
             if !self.plateau_ok(ax, ay) {
                 continue;
             }
-            let big = hills.len() < want / 3;
-            let (ox, oy, mut m) = self.rect_union(ax, ay, cape, big);
+            let (ox, oy, mut m) = self.rect_union(ax, ay, cape, tier);
             // clip to the allowed area, close, clip, open, largest component
             let mut allowed = Mask::new(m.w, m.h);
             for y in 0..m.h {
@@ -290,8 +359,63 @@ impl Gen {
             if bx1 - bx0 < 5 || by1 - by0 < 3 {
                 continue;
             }
+            // the lowland must stay in one piece: a plateau may not seal off a neck of land
+            {
+                // plateau cells and the cliff row below them
+                let covered = |k: usize| -> bool {
+                    let (x, y) = (k as i32 % W - ox, k as i32 / W - oy);
+                    m3.get(x, y) || m3.get(x, y - 1)
+                };
+                // cheap sufficient test first: the lowland cells around the candidate are connected to each other
+                // inside a window 5 cells larger than its box (then any path through the area can go around it)
+                let (wx0, wy0) = ((bx0 - 5).max(0), (by0 - 5).max(0));
+                let (wx1, wy1) = ((bx1 + 5).min(W - 1), (by1 + 6).min(H - 1));
+                let ww = wx1 - wx0 + 1;
+                let wh = wy1 - wy0 + 1;
+                let map = &self.map;
+                let free = |k: usize| lowland(map, k) && !covered(k);
+                let mut ring: Vec<i32> = Vec::new();
+                for y in wy0..=wy1 {
+                    for x in wx0..=wx1 {
+                        let k = idx(x, y) as usize;
+                        if !free(k) {
+                            continue;
+                        }
+                        let touch = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                            .iter()
+                            .any(|(dx, dy)| map.inside(x + dx, y + dy) && covered(idx(x + dx, y + dy) as usize));
+                        if touch {
+                            ring.push((y - wy0) * ww + (x - wx0));
+                        }
+                    }
+                }
+                let local_ok = ring.first().is_some_and(|&r0| {
+                    let seen = flood4(ww, wh, &[r0], |k| {
+                        let (x, y) = (k as i32 % ww + wx0, k as i32 / ww + wy0);
+                        free(idx(x, y) as usize)
+                    });
+                    ring.iter().all(|r| seen[*r as usize] != 0)
+                });
+                let mut lost_land = 0usize;
+                for &c in &cells {
+                    lost_land += 1;
+                    let s = (c + W) as usize;
+                    if self.map.land[s] == 1 && !m3.get(s as i32 % W - ox, s as i32 / W - oy) {
+                        lost_land += 1;
+                    }
+                }
+                if local_ok {
+                    reach = reach.saturating_sub(lost_land);
+                } else {
+                    let after = flood4(W, H, &[b0], free).iter().filter(|v| **v != 0).count();
+                    if after + lost_land + 30 < reach {
+                        continue;
+                    }
+                    reach = after;
+                }
+            }
+            area += cells.len();
             // commit: level, cliffs, spacing halo
-            let mut sea_cliff = false;
             for &c in &cells {
                 self.map.level[c as usize] = 1;
                 self.hill_of[c as usize] = hills.len() as u8 + 1;
@@ -299,10 +423,8 @@ impl Gen {
             for &c in &cells {
                 let s = (c + W) as usize;
                 if self.hill_of[s] != hills.len() as u8 + 1 {
+                    // on water this is a cliff dropping straight into the sea (wet-foot rock face)
                     self.map.cliff[s] = 1;
-                    if self.map.land[s] == 0 {
-                        sea_cliff = true;
-                    }
                 }
                 let (x, y) = (c % W, c / W);
                 for yy in y - 3..=y + 3 {
@@ -319,12 +441,10 @@ impl Gen {
                 stairs: Vec::new(),
                 top: None,
                 anchor: (ax, ay),
-                cape: sea_cliff,
             });
         }
 
         // ---- stairs from the main lowland ----
-        let b0 = idx(self.bases[0].0, self.bases[0].1 + 2);
         let low = {
             let map = &self.map;
             flood4(W, H, &[b0], |k| map.land[k] == 1 && map.level[k] == 0 && map.cliff[k] == 0)
@@ -349,7 +469,7 @@ impl Gen {
             };
             let mut spots = self.stair_spots(&inm, &h.cells, &ground);
             let n = h.cells.len();
-            let count = if n < 70 { 1 } else if n < 220 { 2 } else { 3 };
+            let count = if n < 70 { 1 } else if n < 200 { 2 } else if n < 420 { 3 } else { 4 };
             let put = self.raise_stairs(1, &mut spots, count);
             if put.is_empty() {
                 // no access: flatten it back
@@ -479,14 +599,25 @@ impl Gen {
         if inner_cells.len() < 12 {
             return None;
         }
+        // terrace size grows with the plateau (a massif carries a real upper tier, a plateau a small knoll)
+        let big = h.cells.len() >= 400;
         for _ in 0..30 {
             let (px, py) = inner_cells[self.below(inner_cells.len() as u32) as usize];
             let mut tm = Mask::new(inner.w, inner.h);
-            let nr = 1 + self.below(2);
+            let nr = if big { 2 + self.below(2) } else { 1 + self.below(2) };
             for k in 0..nr {
-                let w = 3 + self.below(7);
-                let hh = 2 + self.below(4);
-                let (ax, ay) = if k == 0 { (px, py) } else { (px + self.below(5) - 2, py + self.below(3) - 1) };
+                let (w, hh) = if big {
+                    (6 + self.below(9), 3 + self.below(4))
+                } else {
+                    (3 + self.below(7), 2 + self.below(4))
+                };
+                let (ax, ay) = if k == 0 {
+                    (px, py)
+                } else if big {
+                    (px + self.below(9) - 4, py + self.below(5) - 2)
+                } else {
+                    (px + self.below(5) - 2, py + self.below(3) - 1)
+                };
                 let rx = ax - self.below(w as u32);
                 let ry = ay - self.below(hh as u32);
                 for y in ry..ry + hh {
@@ -555,6 +686,17 @@ impl Gen {
             let put = self.raise_stairs(2, &mut spots, count);
             for &c in &cells {
                 self.hill_of[c as usize] = id;
+            }
+            if put.is_empty() {
+                // every spot was refused by `bridge_ok`: a terrace without a stair would be an unreachable level
+                // (and `plateaus[].top` needs a first stair) — revert it
+                for &c in &cells {
+                    self.map.level[c as usize] = 1;
+                }
+                for &s in &cliffs {
+                    self.map.cliff[s as usize] = 0;
+                }
+                continue;
             }
             // terrace stair `hi` cells belong to the hill too
             return Some((cells, put));

@@ -8,13 +8,15 @@
 //   war, distance fog. Lit by the scene (darkens at night), receives cliff shadows, casts none.
 // * Foam: one quad of 3×3 tiles per foam cell at the water line, batched per 32×32 chunk. The 16 frames are a
 //   mip-mapped texture array built at load time; the shader picks `floor(t·10) mod 16` (all cells in sync). Land
-//   columns hide the centre of each quad, so only the ring outside the coast shows (as in the 2D game).
+//   columns hide the centre of each quad, so only the ring outside the coast shows (as in the 2D game). On north
+//   shores the column itself would hide the thin ring too (the camera looks north): the ring's north third is
+//   repeated at the column-top height against the north edge (`north_strip_height`).
 
 use crate::AppState;
 use crate::mirror::Mirror;
-use crate::render::consts::WATER_Y;
+use crate::render::consts::{GROUND_Y, WATER_Y};
 use crate::render::terrain::atlas::rgba_mips;
-use crate::render::terrain::{FogTexture, fog_color_linear};
+use crate::render::terrain::{FogTexture, corners, flat_top, fog_color_linear};
 use crate::WATER_COLOR;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -33,6 +35,8 @@ use ts_sim::map::Map;
 pub const FOAM_PATH: &str = "Terrain/Tileset/Water Foam.png";
 /// Foam frames / frame size / fps (spec 09 §4.2).
 pub const FOAM_FRAMES: u32 = 16;
+// WebGL2 guesses a cube (array) target for 6·k layers (see `terrain_atlas::gl_safe_layers`)
+const _: () = assert!(FOAM_FRAMES % 6 != 0);
 pub const FOAM_PX: u32 = 192;
 pub const FOAM_FPS: f32 = 10.0;
 /// Shallow-water distance range (cells) of the shore texture.
@@ -186,12 +190,12 @@ fn mip_count(n: u32) -> u32 {
     32 - n.max(1).leading_zeros()
 }
 
-/// Per-cell distance to the nearest land cell (0 on land … 255 at `SHORE_CELLS` or more), R8, linear.
+/// Per-cell distance to the nearest ground (land or sea-cliff column; 0 there … 255 at `SHORE_CELLS` or more), R8, linear.
 fn shore_image(map: &Map) -> Image {
     let (w, h) = (map.w.max(1) as usize, map.h.max(1) as usize);
     let mut d = vec![f32::INFINITY; w * h];
     for (i, v) in d.iter_mut().enumerate() {
-        if map.land.get(i).copied().unwrap_or(0) != 0 {
+        if map.land.get(i).copied().unwrap_or(0) != 0 || map.cliff.get(i).copied().unwrap_or(0) != 0 {
             *v = 0.0;
         }
     }
@@ -260,11 +264,15 @@ fn shore_image(map: &Map) -> Image {
     img
 }
 
-/// Foam cells (spec 02 §5.11): land cells (`land > 0`) with a non-land 8-neighbour (outside counts as water).
+/// Foam cells (spec 02 §5.11, 09 §4.2): land cells (`land > 0`) with a non-land 8-neighbour (outside counts as
+/// water), plus every water cell that is a cliff (a cliff dropping into the sea).
 pub fn is_foam_cell(map: &Map, x: i32, y: i32) -> bool {
     let ground = |x: i32, y: i32| map.inside(x, y) && map.land[map.idx(x, y) as usize] != 0;
-    if !ground(x, y) {
+    if !map.inside(x, y) {
         return false;
+    }
+    if !ground(x, y) {
+        return map.cliff[map.idx(x, y) as usize] != 0;
     }
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -274,6 +282,20 @@ pub fn is_foam_cell(map: &Map, x: i32, y: i32) -> bool {
         }
     }
     false
+}
+
+/// Height of the lifted north surf strip of a land cell (`None` = not a lowland cell with open water north of it).
+fn north_strip_height(map: &Map, cx: i32, cy: i32) -> Option<f32> {
+    if !map.inside(cx, cy) {
+        return None;
+    }
+    let i = map.idx(cx, cy) as usize;
+    if map.land[i] == 0 || map.cliff[i] != 0 || flat_top(map, cx, cy - 1).is_some() {
+        return None;
+    }
+    let c = corners(map, cx, cy)?;
+    let top = c[0].max(c[1]).max(c[2]).max(c[3]);
+    (top <= GROUND_Y + 1e-3).then_some(top)
 }
 
 /// Foam quads of one chunk (3×3 tiles centred on each foam cell, slightly above the water).
@@ -297,6 +319,26 @@ fn foam_chunk(map: &Map, ccx: i32, ccy: i32) -> Option<Mesh> {
             ]);
             uv.extend([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
             idx.extend([base, base + 3, base + 2, base, base + 2, base + 1]);
+            // North shores: the camera looks north, so the low land column hides the thin north ring of the foam
+            // (≈ 6 px beyond the tile) lying on the water behind it. Repeat the north third of the quad (ring
+            // and corners) at the height of the column top, right against its north edge, where it reads as the
+            // surf line of the 2D art. Only for lowland / beach columns with open water to the north (raised
+            // tiers show a rock face there).
+            if let Some(top) = north_strip_height(map, cx, cy) {
+                let open = |dx: i32| flat_top(map, cx + dx, cy).is_none();
+                // a land neighbour on the same row would get the strip's corner over its top face: cut it
+                let (u0, u1) = (
+                    if open(-1) { 0.0 } else { 1.0 / 3.0 },
+                    if open(1) { 1.0 } else { 2.0 / 3.0 },
+                );
+                let (xa, xb) = (x0 + u0 * 3.0, x0 + u1 * 3.0);
+                let (za, zb) = (cy as f32 - 1.0, cy as f32);
+                let ys = top + 0.002;
+                let base = pos.len() as u32;
+                pos.extend([[xa, ys, za], [xb, ys, za], [xb, ys, zb], [xa, ys, zb]]);
+                uv.extend([[u0, 0.0], [u1, 0.0], [u1, 1.0 / 3.0], [u0, 1.0 / 3.0]]);
+                idx.extend([base, base + 3, base + 2, base, base + 2, base + 1]);
+            }
         }
     }
     if idx.is_empty() {
@@ -329,7 +371,9 @@ fn rebuild_water(
     mut foam_mats: ResMut<Assets<FoamMaterial>>,
     mut built: Local<Option<u32>>,
 ) {
-    if *built == Some(mirror.generation) {
+    // new generation, or the sea was despawned (left `InGame` and came back to the same match without a new `Init`;
+    // the sea plane always exists once built)
+    if *built == Some(mirror.generation) && !old.is_empty() {
         return;
     }
     let Some(map) = mirror.map() else { return };
@@ -423,6 +467,31 @@ mod tests {
         assert!(!is_foam_cell(&m, 2, 2));
         assert!(!is_foam_cell(&m, 0, 0));
         assert!(foam_chunk(&m, 0, 0).is_some());
+    }
+
+    #[test]
+    fn north_shore_gets_a_lifted_strip() {
+        let mut m = Map::with_size(6, 6);
+        for y in 1..5 {
+            for x in 1..5 {
+                let i = m.idx(x, y) as usize;
+                m.land[i] = 1;
+                m.surface[i] = ts_sim::map::Surface::GrassLow;
+            }
+        }
+        // north row of the island: water to the north → strip at the column top
+        assert_eq!(north_strip_height(&m, 2, 1), Some(GROUND_Y));
+        // inner / south rows: land to the north
+        assert_eq!(north_strip_height(&m, 2, 2), None);
+        // raised tier: no strip (rock face)
+        let i = m.idx(3, 1) as usize;
+        m.level[i] = 1;
+        assert_eq!(north_strip_height(&m, 3, 1), None);
+        let mesh = foam_chunk(&m, 0, 0).expect("foam");
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) else {
+            panic!("positions");
+        };
+        assert!(pos.iter().any(|p| (p[1] - GROUND_Y - 0.002).abs() < 1e-4 && (p[2] - 1.0).abs() < 1e-4));
     }
 
     #[test]

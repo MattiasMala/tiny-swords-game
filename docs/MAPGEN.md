@@ -53,6 +53,19 @@ livello solo dalle scale, edifici su un solo livello); oro sull'altopiano centra
 a «i più vicini al centro» se gli altopiani sono meno); punti da conquistare, grandi giacimenti, forzieri; niente
 di utile in punti irraggiungibili. Determinismo: stesso seme → stessa mappa (il client la rigenera dal seme).
 
+## Osservazioni sulla prima versione (seme 7, 2026-11-19)
+
+- I **sentieri** sono segmenti dritti a L, lunghi e paralleli agli assi: sembrano una griglia stradale, non
+  sentieri. Devono seguire il terreno con curve dolci (A* con costo che premia leggermente la diagonale e un
+  rumore di costo, poi lisciatura), essere più corti e meno numerosi (castello→castello vicini e verso i punti
+  vicini, non una rete che attraversa tutta l'isola), con biforcazioni naturali.
+- Gli **alberi** sono ancora puntini sparsi nei prati (le macchie arancioni). Servono boschi compatti (decine
+  di alberi fitti) e ciuffi di 3–6 sui bordi degli altopiani e sulla costa; i prati aperti senza alberi.
+- Il livello 0 occupa quasi tutto: più altopiani (livello 1) estesi e collegati, con terrazze di livello 2
+  visibili su quelli grandi; alcune pareti a picco sul mare.
+- I boschi di abeti su `color5` sono buoni ma piccoli e circolari: forme più irregolari e più grandi.
+- Le macchie di prato secco (`color4`, marroni) sono rettangoli troppo regolari: contorni morbidi.
+
 ## Strumenti di verifica
 
 - `cargo run -p ts-sim --release --example mapgen_png -- --seed N --out map.png`: vista dall'alto colorata

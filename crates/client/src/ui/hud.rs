@@ -350,6 +350,7 @@ fn draw_shortcuts(u: &mut Ui, st: &mut UiState, env: &mut Env, v: &View, s: f32)
             if let Some(sc) = c.screen {
                 st.open(sc);
                 selection::cancel_modes(env);
+                u.p.focus = None;
             } else {
                 let why = selection::run_shortcut(i, st, env);
                 st.say(why);

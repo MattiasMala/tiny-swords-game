@@ -263,7 +263,7 @@ impl World {
                 rmin = 1;
             }
         }
-        let Some((sx, sy)) = self.ai_find_spot(kind, x, y, rmin, 18) else {
+        let Some((sx, sy)) = self.ai_find_spot(f, kind, x, y, rmin, 18) else {
             return false;
         };
         let spot = v2(sx as f32 * TILE, sy as f32 * TILE);

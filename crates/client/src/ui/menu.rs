@@ -1,6 +1,6 @@
 //! Main menu and multiplayer lobby (spec 06 §4-§5, ui.js:553-647).
 
-use super::kit::{ACCENT, INK, IconSpec, Ui, WHITE, panel};
+use super::kit::{ACCENT, INK, Ui, WHITE, panel};
 use super::paint::Align;
 use super::{Env, UiState};
 use crate::AppState;
@@ -18,7 +18,7 @@ fn level_unit(l: AiLevel) -> UnitKind {
 }
 
 /// `drawMenu`.
-pub fn draw_menu(u: &mut Ui, st: &mut UiState, env: &mut Env) {
+pub fn draw_menu(u: &mut Ui, st: &mut UiState, env: &mut Env, force_lobby: bool) {
     let (w, h) = (u.w(), u.h());
     let s = (w / 980.0).min(h / 760.0).min(1.35);
     let pw = 720.0 * s;
@@ -27,7 +27,7 @@ pub fn draw_menu(u: &mut Ui, st: &mut UiState, env: &mut Env) {
     let py = (h - ph) / 2.0 + 28.0 * s;
     u.p.locked = st.help;
     u.store_banner(px, py, pw, ph, s);
-    if *env.state.get() == AppState::Lobby {
+    if *env.state.get() == AppState::Lobby || force_lobby {
         draw_lobby(u, st, env, s, px, py, pw);
     } else {
         draw_main(u, st, env, s, px, py);
@@ -93,7 +93,13 @@ fn level_row(
         let clicked = enabled && u.p.hit(cx - 80.0 * s, y - 4.0 * s, 160.0 * s, 136.0 * s).clicked;
         u.panel(&panel::BANNER_SLOTS, cx - 72.0 * s, y, 144.0 * s, 100.0 * s, 0.7 * s);
         let k = level_unit(l);
-        let frame = (clock * 8.0).floor() as usize;
+        let fps = u
+            .atlas
+            .sheet_id(&super::kit::unit_idle_sheet(color, k))
+            .map(|id| u.atlas.sheet(id).fps)
+            .filter(|f| *f > 0.0)
+            .unwrap_or(8.0) as f64;
+        let frame = (clock * fps).floor() as usize;
         u.unit_frame(color, k, frame, cx, y + 86.0 * s, 0.9 * s);
         u.plain(l.label(), cx, y + 118.0 * s, 16.0 * s, INK, Align::Center);
         if selected == l {
@@ -194,7 +200,8 @@ fn draw_lobby(u: &mut Ui, st: &mut UiState, env: &mut Env, s: f32, px: f32, py: 
     let players = env.lobby.players.clone();
     let leader = env.lobby.leader;
     let me_id = me.id;
-    let info = move |c: KingdomColor| {
+    let taken = |c: KingdomColor| players.iter().any(|p| p.color == c);
+    let info = |c: KingdomColor| {
         let p = players.iter().find(|p| p.color == c);
         match p {
             Some(p) => {
@@ -210,8 +217,10 @@ fn draw_lobby(u: &mut Ui, st: &mut UiState, env: &mut Env, s: f32, px: f32, py: 
             None => ("IA".to_string(), UnitKind::Pawn, true),
         }
     };
+    // `Net.choose(color)`: only a free kingdom can be taken (the server checks again)
     if let Some(c) = kingdom_row(u, py + 146.0 * s, s, Some(me.color), &info)
         && c != me.color
+        && !taken(c)
     {
         env.lobby.color = c;
         env.out.send(ClientMsg::Pick { color: c });
@@ -259,5 +268,22 @@ fn draw_lobby(u: &mut Ui, st: &mut UiState, env: &mut Env, s: f32, px: f32, py: 
             Align::Center,
         );
     }
-    let _ = IconSpec::Ui(0);
+}
+
+/// Native dev helper (`TS_UI_SCREEN=lobby` on the menu): fills the lobby with sample players so the lobby screen can be
+/// screenshotted without a server.
+pub fn dev_fake_lobby(env: &mut Env) {
+    if env.lobby.you.is_some() {
+        return;
+    }
+    let p = |id: u32, name: &str, color: KingdomColor| ts_sim::proto::LobbyPlayer {
+        id,
+        name: name.to_string(),
+        color,
+        connected: true,
+    };
+    env.lobby.players = vec![p(1, "Anna", KingdomColor::Red), p(2, "Bruno", KingdomColor::Blue)];
+    env.lobby.you = Some(1);
+    env.lobby.leader = Some(1);
+    env.lobby.urls = vec!["http://192.168.1.20:8000".to_string()];
 }

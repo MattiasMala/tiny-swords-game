@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -51,6 +51,8 @@ pub struct ConnHandle {
     pub snaps: Arc<AtomicUsize>,
     /// bytes queued, not written yet
     pub bytes: Arc<AtomicUsize>,
+    /// set by the room when it drops the connection (slow consumer): the writer stops at once
+    pub kill: Arc<AtomicBool>,
 }
 
 impl ConnHandle {
@@ -59,6 +61,7 @@ impl ConnHandle {
             tx,
             snaps: Arc::new(AtomicUsize::new(0)),
             bytes: Arc::new(AtomicUsize::new(0)),
+            kill: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -81,6 +84,11 @@ impl ConnHandle {
             return false;
         }
         true
+    }
+
+    /// The room dropped this connection: the writer must stop without flushing.
+    pub fn killed(&self) -> bool {
+        self.kill.load(Ordering::Relaxed)
     }
 
     /// Writer side: a frame of `len` bytes was written (or dropped); `snap` = it was a snapshot.
@@ -189,6 +197,7 @@ fn flush(room: &mut Room, conns: &mut HashMap<ConnId, ConnHandle>, stats: &mut S
     for c in dead {
         if let Some(h) = conns.remove(&c) {
             println!("giocatore {c} troppo lento: connessione chiusa");
+            h.kill.store(true, Ordering::Relaxed);
             let _ = h.tx.send(Out::Close);
             room.disconnect(c);
         }

@@ -116,7 +116,7 @@ impl Gen {
             t += 1;
             let base = out[self.below(out.len() as u32) as usize];
             let (bx, by) = (base % W, base / W);
-            let step = if self.chance(0.22) { 2 } else { 1 };
+            let step = if self.chance(0.08) { 2 } else { 1 };
             let (dx, dy) = crate::defs::DIRS8[self.below(8) as usize];
             let (x, y) = (bx + dx * step, by + dy * step);
             let (ox, oy) = ((x - sx) as f64, (y - sy) as f64);
@@ -155,11 +155,19 @@ impl Gen {
                     }
                     return false;
                 }
-                let sp = self.species(px, py);
+                // groves are the dense pine woods on their teal floor (ref. §11.6); forests follow the region
+                let sp = if let Some(sp) = self.force_sp.take() {
+                    sp
+                } else if kind == Group::Grove {
+                    if self.chance(0.5) { (PINE[0], PINE[1]) } else { (PINE[1], PINE[0]) }
+                } else {
+                    self.species(px, py)
+                };
                 let mix = if sp.0 < 2 { 0.2 } else { 0.35 };
                 self.push_trees(&cells, sp, mix);
                 if !cells.is_empty() {
                     self.woods.push((px as f32, py as f32, r as f32));
+                    self.wood_sp.push(sp);
                 }
                 cells.len() >= 5
             }
@@ -218,12 +226,19 @@ impl Gen {
                     let d0 = edge + pad + far;
                     let mut d = d0;
                     while d <= d0.max(12.5 + far) {
-                        let meadow = kind == Group::Meadow;
+                        // cells stay inside the radius `sound()` counts them in (BASE_STOCK: 14 near, 22 far;
+                        // meadows 14), so a fair start never depends on luck
+                        let r2 = match kind {
+                            Group::Meadow => 13 * 13,
+                            Group::Forest | Group::Grove => 16 * 16,
+                            _ if far > 0.0 => 21 * 21,
+                            _ => 13 * 13,
+                        };
                         let ok = move |g: &Gen, c: i32| {
-                            g.free_low(c) && (!meadow || {
+                            g.free_low(c) && {
                                 let (x, y) = (c % W - bx, c / W - by);
-                                x * x + y * y < 13 * 13
-                            })
+                                x * x + y * y <= r2
+                            }
                         };
                         if self.place(kind, bx as f64 + ca * d, by as f64 + sa * d, &ok, true) {
                             break 'turns;
@@ -289,17 +304,15 @@ impl Gen {
             }
         }
         for (k, &(h, x, y)) in sites.iter().enumerate() {
-            let id = h as u8 + 1;
-            let ok = move |g: &Gen, c: i32| g.hill_of[c as usize] == id && g.free_high(c);
             let (hx, hy) = (x as f64, y as f64);
             if k == 0 {
                 for ox in [-3.0, 0.0, 3.0] {
-                    self.place(Group::Gold, hx + ox, hy, &ok, false);
+                    self.site_group(Group::Gold, h, hx + ox, hy);
                 }
-                self.place(Group::Stone, hx, hy + 2.5, &ok, false);
+                self.site_group(Group::Stone, h, hx, hy + 2.5);
             } else {
-                self.place(Group::Gold, hx, hy, &ok, false);
-                self.place(Group::Stone, hx + 3.0, hy + 1.0, &ok, false);
+                self.site_group(Group::Gold, h, hx, hy);
+                self.site_group(Group::Stone, h, hx + 3.0, hy + 1.0);
             }
         }
         // rim clumps
@@ -342,6 +355,58 @@ impl Gen {
                 let sp = self.species(x as f64, y as f64);
                 self.push_trees(&got, sp, 0.35);
                 placed += got.len();
+            }
+            // every plateau holds at least 3 trees (02 §6.6): a crowded rim falls back to any free cell of the hill,
+            // rim cells first
+            if placed < 3 {
+                let mut cand: Vec<i32> = rim.iter().copied().filter(|&c| self.free_high(c)).collect();
+                cand.extend(cells.iter().copied().filter(|&c| self.free_high(c) && !rim.contains(&c)));
+                if !cand.is_empty() {
+                    let (x, y) = (cand[0] % W, cand[0] / W);
+                    let sp = self.species(x as f64, y as f64);
+                    let mut got = Vec::new();
+                    for c in cand {
+                        if placed + got.len() >= 3 {
+                            break;
+                        }
+                        if self.hill_of[c as usize] == id && self.free_high(c) {
+                            self.used[c as usize] = 1;
+                            got.push(c);
+                        }
+                    }
+                    self.push_trees(&got, sp, 0.35);
+                }
+            }
+        }
+    }
+
+    /// One gold / stone group of a mineral site on hill `h` at `(x, y)` (non-strict, as the JS); if not a single
+    /// node fits there (crowded anchor), the group goes to the free cells of the hill nearest the site, so every
+    /// site really holds its ore (W4).
+    fn site_group(&mut self, kind: Group, h: usize, x: f64, y: f64) {
+        let id = h as u8 + 1;
+        let ok = move |g: &Gen, c: i32| g.hill_of[c as usize] == id && g.free_high(c);
+        let count = |g: &Gen| if kind == Group::Gold { g.golds.len() } else { g.stones.len() };
+        let before = count(self);
+        self.place(kind, x, y, &ok, false);
+        if count(self) > before {
+            return;
+        }
+        let mut cand: Vec<(i64, i32)> = self.hills[h]
+            .cells
+            .iter()
+            .copied()
+            .filter(|&c| ok(self, c))
+            .map(|c| {
+                let (dx, dy) = ((c % W) as f64 - x, (c / W) as f64 - y);
+                (((dx * dx + dy * dy) * 16.0) as i64, c)
+            })
+            .collect();
+        cand.sort_unstable();
+        for &(_, c) in cand.iter().take(12) {
+            self.place(kind, (c % W) as f64, (c / W) as f64, &ok, false);
+            if count(self) > before {
+                return;
             }
         }
     }
@@ -435,9 +500,28 @@ impl Gen {
                 PointKind::Outpost => None,
             };
             if let Some(gr) = group {
+                // the two JS spots (east, west; non-strict), then other sides of the point until two groups stand:
+                // every mine / quarry / sawmill / ranch must carry its stock (02 §6.7)
+                const SPOTS: [(f64, f64, bool); 8] = [
+                    (4.5, 0.0, false),
+                    (-4.5, 1.0, false),
+                    (0.5, 4.5, true),
+                    (0.5, -3.5, true),
+                    (4.5, 4.0, true),
+                    (-4.5, -3.0, true),
+                    (4.5, -3.0, true),
+                    (-4.5, 4.0, true),
+                ];
                 let (px, py) = (x as f64 + 1.0, y as f64 + 1.0);
-                self.place(gr, px + 4.5, py, &|g, c| g.free_low(c), false);
-                self.place(gr, px - 4.5, py + 1.0, &|g, c| g.free_low(c), false);
+                let mut done = 0;
+                for (ox, oy, strict) in SPOTS {
+                    if done >= 2 {
+                        break;
+                    }
+                    if self.place(gr, px + ox, py + oy, &|g, c| g.free_low(c), strict) {
+                        done += 1;
+                    }
+                }
             }
         }
         let nb = (5.0 * 4.0 * self.rich).round() as usize;
@@ -469,13 +553,16 @@ impl Gen {
             let mut t = 0;
             while t < 4000 && placed < target {
                 t += 1;
-                let woody = matches!(kind, Group::Forest | Group::Grove) && !self.woods.is_empty() && self.chance(0.5);
+                // most groups extend an existing wood (touching it): a few big compact woods of dozens of trees
+                // instead of many small dots, and calm open meadows between them (MAPGEN §6)
+                let woody = matches!(kind, Group::Forest | Group::Grove) && self.woods.len() >= 3 && self.chance(0.8);
+                let mut sp = None;
                 let (x, y) = if woody {
-                    // grow an existing wood: next to one of its groups (bigger woods, calmer meadows)
                     let wi = self.below(self.woods.len() as u32) as usize;
+                    sp = self.wood_sp.get(wi).copied();
                     let (wx, wy, wr) = self.woods[wi];
                     let (dx, dy) = DIRS8[self.below(8) as usize];
-                    let d = wr as f64 + 2.0 + self.rnd() * 3.0;
+                    let d = wr as f64 * 0.9 + 1.0 + self.rnd() * 1.5;
                     let (x, y) = (wx as f64 + dx as f64 * d, wy as f64 + dy as f64 * d);
                     if x < 4.0 || y < 4.0 || x >= (W - 4) as f64 || y >= (H - 4) as f64 {
                         continue;
@@ -510,8 +597,14 @@ impl Gen {
                 if self.rnd() >= w {
                     continue;
                 }
-                if self.far_from_bases(x, y) && self.place(kind, x, y, &|g, c| g.free_low(c), false) {
-                    placed += 1;
+                if self.far_from_bases(x, y) {
+                    // a group extending a wood keeps its species (pines with pines, birches with birches)
+                    self.force_sp = sp;
+                    let ok = self.place(kind, x, y, &|g, c| g.free_low(c), false);
+                    self.force_sp = None;
+                    if ok {
+                        placed += 1;
+                    }
                 }
             }
         }

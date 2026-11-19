@@ -753,9 +753,18 @@ impl Room {
                 .find(|c| c.id == conn)
                 .is_none_or(|c| c.congested);
             if congested {
-                // hold back what must not be lost; cosmetic events are dropped
-                s.backlog
-                    .extend(events.iter().filter(|e| !e.is_cosmetic()).cloned());
+                // hold back what must not be lost (only what this recipient may see: other kingdoms' private
+                // notices must not crowd its own out of the bounded backlog); cosmetic events are dropped
+                let me = match viewer {
+                    Viewer::Player(f) => Some(f),
+                    Viewer::Spectator => None,
+                };
+                s.backlog.extend(
+                    events
+                        .iter()
+                        .filter(|e| !e.is_cosmetic() && e.is_for(me))
+                        .cloned(),
+                );
                 if s.backlog.len() > MAX_BACKLOG {
                     let extra = s.backlog.len() - MAX_BACKLOG;
                     s.backlog.drain(..extra);
@@ -1206,7 +1215,16 @@ mod tests {
             .as_mut()
             .unwrap()
             .emit(GameEvent::Toast { to: f, msg: crate::events::Msg::PawnsMax });
+        // another kingdom's private notice is not held back for this recipient
+        r.world
+            .as_mut()
+            .unwrap()
+            .emit(GameEvent::Toast { to: (f + 1) % 5, msg: crate::events::Msg::PawnsMax });
         r.tick();
+        assert!(r.sessions[0]
+            .backlog
+            .iter()
+            .all(|e| e.is_for(Some(f)) && !e.is_cosmetic()));
         r.tick();
         assert!(!r.drain_outbox().iter().any(|(_, m)| matches!(m, ServerMsg::Snapshot(_))));
         r.set_congested(1, false);

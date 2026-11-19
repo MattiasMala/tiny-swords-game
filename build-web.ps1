@@ -1,10 +1,12 @@
 # Builds the browser client into web/pkg (OWNER: C4).
 #   .\build-web.ps1            then: cargo run -p ts-server --release   (http://localhost:8000)
 #   .\build-web.ps1 -NoOpt     skip wasm-opt (faster, bigger)
-# Steps: cargo (profile wasm-release: opt-level "s", fat LTO, 1 CGU) -> wasm-bindgen (must match the wasm-bindgen
+# Steps: cargo (profile wasm-release: opt-level "z" (sim crate 3), fat LTO, 1 CGU) -> wasm-bindgen (must match the wasm-bindgen
 # crate version in Cargo.lock) -> wasm-opt (binaryen; downloaded into ~/.cargo/bin when missing).
 param([switch]$NoOpt)
-$ErrorActionPreference = 'Stop'
+# 'Continue': cargo / wasm-bindgen write progress to stderr, which Windows PowerShell 5.1 turns into terminating
+# error records when the output is redirected; failures are detected through $LASTEXITCODE instead.
+$ErrorActionPreference = 'Continue'
 Set-Location $PSScriptRoot
 
 $BinaryenVersion = 'version_133'
@@ -42,22 +44,25 @@ if (-not $NoOpt) {
     Write-Host "wasm-opt non trovato: scarico binaryen $BinaryenVersion in $dest"
     try {
       $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("binaryen-" + [guid]::NewGuid())
-      New-Item -ItemType Directory -Force $tmp | Out-Null
+      New-Item -ItemType Directory -Force $tmp -ErrorAction Stop | Out-Null
       $tgz = Join-Path $tmp 'b.tar.gz'
-      Invoke-WebRequest -Uri $url -OutFile $tgz -UseBasicParsing
+      Invoke-WebRequest -Uri $url -OutFile $tgz -UseBasicParsing -ErrorAction Stop
       tar -xzf $tgz -C $tmp
-      Copy-Item (Join-Path $tmp "binaryen-$BinaryenVersion\bin\wasm-opt.exe") $dest -Force
-      Remove-Item -Recurse -Force $tmp
+      if ($LASTEXITCODE -ne 0) { throw "tar: codice $LASTEXITCODE" }
+      New-Item -ItemType Directory -Force $dest -ErrorAction Stop | Out-Null
+      Copy-Item (Join-Path $tmp "binaryen-$BinaryenVersion\bin\wasm-opt.exe") $dest -Force -ErrorAction Stop
+      Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
       $opt = Get-Command wasm-opt -ErrorAction SilentlyContinue
-      if (-not $opt) { $opt = Get-Command (Join-Path $dest 'wasm-opt.exe') }
+      if (-not $opt) { $opt = Get-Command (Join-Path $dest 'wasm-opt.exe') -ErrorAction Stop }
     } catch {
       Write-Host "download di wasm-opt fallito ($_): salto l'ottimizzazione"
       $opt = $null
     }
   }
   if ($opt) {
-    # features used by rustc's default wasm32 target; -O3: speed matters (sim + 60 fps), it still shrinks
-    & $opt.Source -O3 --strip-debug --strip-producers `
+    # features used by rustc's default wasm32 target. -Oz: about 10 % smaller than -O3 (25 vs 28 MB); the browser JIT
+    # inlines small hot functions anyway, and the sim crate is compiled at opt-level 3 by cargo
+    & $opt.Source -Oz --strip-debug --strip-producers `
       --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals `
       --enable-reference-types --enable-multivalue `
       -o $bg $bg

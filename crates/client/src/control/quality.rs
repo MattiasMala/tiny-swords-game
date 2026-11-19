@@ -112,10 +112,12 @@ impl GraphicsQuality {
 pub fn watch(
     time: Res<Time<Real>>,
     state: Res<State<AppState>>,
+    dev: Res<crate::dev::DevArgs>,
     mut q: ResMut<GraphicsQuality>,
     mut ui: ResMut<UiState>,
 ) {
-    if *state.get() != AppState::InGame {
+    // dev screenshots render their first frames slowly while pipelines compile: never degrade (or toast) there
+    if *state.get() != AppState::InGame || dev.screenshot.is_some() {
         return;
     }
     if let Some(t) = q.watch(time.delta_secs()) {

@@ -17,6 +17,8 @@
 
 mod lan;
 mod room_task;
+#[cfg(test)]
+mod e2e_tests;
 
 use axum::{
     Router,
@@ -32,7 +34,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use room_task::{ConnHandle, Out, RoomEvent};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -117,18 +119,7 @@ async fn main() {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(room_task::run(rx, urls.clone()));
     let room_tx = tx.clone();
-
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .nest_service("/assets", ServeDir::new(root.join("assets")))
-        .nest_service("/fonts", ServeDir::new(root.join("fonts")))
-        .fallback_service(ServeDir::new(root.join("web")))
-        .layer(CompressionLayer::new())
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-cache"),
-        ))
-        .with_state(AppCtx { room: tx });
+    let app = router(&root, tx);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -168,6 +159,21 @@ async fn main() {
     }
 }
 
+/// Static files + `/ws`; every response `Cache-Control: no-cache`, gzip/br.
+fn router(root: &Path, room: mpsc::UnboundedSender<RoomEvent>) -> Router {
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .nest_service("/assets", ServeDir::new(root.join("assets")))
+        .nest_service("/fonts", ServeDir::new(root.join("fonts")))
+        .fallback_service(ServeDir::new(root.join("web")))
+        .layer(CompressionLayer::new())
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+        .with_state(AppCtx { room })
+}
+
 fn plain(status: StatusCode, text: &'static str) -> Response {
     Response::builder()
         .status(status)
@@ -182,6 +188,10 @@ async fn ws_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(ctx): State<AppCtx>,
 ) -> Response {
+    // same order as server.py: 400 for a non-WebSocket request first, then the Origin check
+    let Ok(ws) = ws else {
+        return plain(StatusCode::BAD_REQUEST, "WebSocket richiesto");
+    };
     // Origin check (08 §A.2): only pages served by this same host may connect; a missing Origin is allowed.
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let host = headers
@@ -193,9 +203,6 @@ async fn ws_handler(
             return plain(StatusCode::FORBIDDEN, "Origine non ammessa");
         }
     }
-    let Ok(ws) = ws else {
-        return plain(StatusCode::BAD_REQUEST, "WebSocket richiesto");
-    };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
         .max_frame_size(MAX_CLIENT_MESSAGE)
         .on_upgrade(move |socket| client(socket, peer, ctx))
@@ -241,6 +248,10 @@ async fn client(socket: WebSocket, peer: SocketAddr, ctx: AppCtx) {
             tokio::select! {
                 o = out_rx.recv() => {
                     let Some(o) = o else { break };
+                    if handle.killed() {
+                        // dropped as a slow consumer: do not keep writing megabytes of stale frames
+                        break;
+                    }
                     let (snap, len) = (matches!(o, Out::Snap(_)), o.len());
                     let res = match o {
                         Out::Bin(b) | Out::Snap(b) => sink.send(Message::Binary(b.into())).await,

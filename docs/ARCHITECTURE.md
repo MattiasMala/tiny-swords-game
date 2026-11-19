@@ -27,9 +27,9 @@ sono in `docs/spec/*.md`; le note sulle API di Bevy 0.20 in `docs/bevy-0.20-note
 ## Simulazione (`ts_sim`)
 
 - Tick fisso a 20 Hz (`TICK_DT = 0.05 s`), `f32`, RNG proprio (PCG32) con seme per partita.
-- Coordinate: `x` verso est, `y` verso sud, in caselle (1.0 = una casella). L'altezza è un livello intero
-  della casella (`0` acqua … `3`), più le rampe/scale.
-- Entità in slab con id generazionale (`EntityId(u32)`), griglia spaziale per le query di vicinanza.
+- Coordinate: `x` verso est, `y` verso sud, in pixel del vecchio gioco (una casella = 64). L'altezza è il livello
+  intero della casella (0, 1, 2), più le scale.
+- Entità in slab con id generazionali (`UnitId`, `BuildingId`, …), griglia spaziale per le query di vicinanza.
 - Nebbia: `explored` e `visible` per fazione, aggiornate a 5 Hz.
 - Le istantanee per giocatore contengono solo ciò che quel giocatore vede (niente "occhi" sui nemici).
 
@@ -39,7 +39,8 @@ sono in `docs/spec/*.md`; le note sulle API di Bevy 0.20 in `docs/bevy-0.20-note
 - Il primo messaggio del client è `Hello { token, name }`. Il server risponde con la lobby, oppure, se il
   token appartiene a un regno di una partita in corso, con `Rejoin` + istantanea completa.
 - Istantanee a 20 Hz: unità visibili ogni tick, edifici/giacimenti/memoria della nebbia solo quando cambiano.
-- Se tutti gli umani sono disconnessi la partita si mette in pausa e riprende appena qualcuno torna.
+- Se un giocatore si disconnette l’IA guida subito il suo regno; con lo stesso token lo riprende per tutta la partita.
+  Se nessun giocatore è collegato la partita continua (guidata dall’IA) e viene chiusa dopo 5 minuti.
 
 ## Rendering HD-2D
 

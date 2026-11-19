@@ -19,7 +19,7 @@ use crate::render::light::{LightCandidates, LightSrc};
 use crate::render::sprites::{
     Basis, DrawStage, Flavor, Layer, Painter, SpriteBatches, SpriteOpts, drawable, foot_world,
 };
-use crate::render::sprites_overlay::LabelRequests;
+use crate::render::sprites_overlay::{LabelReq, LabelRequests};
 use crate::render::sprites_world::{Fog, NONE, Sheets};
 use crate::render::terrain::FogTexture;
 use bevy::asset::RenderAssetUsages;
@@ -292,6 +292,10 @@ fn draw_fx(
         }
         let fr = (f.t * f.fps).floor() as i64;
         let water = f.kind == FxKind::Splash;
+        // ambient splashes are drawn under the 2D fog: never on unexplored water
+        if water && !fog.knows(f.x, f.y) {
+            continue;
+        }
         let foot = if water {
             Vec3::new(f.x * PX, crate::render::consts::WATER_Y, f.y * PX)
         } else {
@@ -346,14 +350,6 @@ fn draw_floats(
         // (x, y) is a 2D point: a ground point lifted by the rise so far
         let rise = f.t * 28.0;
         let foot = foot_world(map, f.x, f.y + rise);
-        let w = foot + basis.up * rise;
-        let Some((s, _)) = basis.project(w) else {
-            continue;
-        };
-        let k = match basis.project(w + basis.right * 100.0) {
-            Some((b, _)) => (b - s).length() / 100.0,
-            None => 1.0,
-        };
         let icon = match f.res {
             ResKind::Wood => ga.image("UI Elements/UI Elements/Icons/Icon_02.png"),
             ResKind::Gold => ga.image("UI Elements/UI Elements/Icons/Icon_03.png"),
@@ -365,14 +361,17 @@ fn draw_floats(
         } else {
             format!("{}", f.text_amount)
         };
-        labels.list.push((
-            s - Vec2::new(33.0 * k, 0.0),
+        // icon 30 px centred at (x - 18, y), label left-aligned at x (07 §8.5)
+        labels.list.push(LabelReq {
+            world: foot + basis.up * rise,
+            dx: -33.0,
             text,
-            18.0 * k,
-            Color::srgba_u8(0xff, 0xf7, 0xc9, (a * 255.0) as u8),
+            size: 18.0,
+            color: Color::srgba_u8(0xff, 0xf7, 0xc9, (a * 255.0) as u8),
             icon,
-            false,
-        ));
+            icon_size: 30.0,
+            centred: false,
+        });
     }
 }
 
@@ -392,20 +391,23 @@ fn clouds(
     let Some(g) = mirror.world.as_ref() else {
         return;
     };
-    if st.materials.is_empty() {
-        // one dithered silhouette per cloud image (half-resolution checkerboard ⇒ ~50 % shadow after PCF)
+    if st.materials.len() < 8 {
+        // one dithered silhouette per cloud image (half-resolution checkerboard ⇒ ~50 % shadow after PCF); all 8 or
+        // nothing (a missing image must not leave a partial set that `variant % 8` would index past)
+        let mut silhouettes = Vec::with_capacity(8);
         for v in 0..8 {
             let rel = format!("Terrain/Decorations/Clouds/Clouds_0{}.png", v + 1);
-            let Some(src) = ga.image(&rel).and_then(|h| images.get(&h).cloned()) else {
+            let Some(src) = ga.image(&rel).and_then(|h| images.get(&h)) else {
                 return;
             };
             let (w, h) = (src.width(), src.height());
-            let Some(data) = src.data.as_ref() else {
+            let rgba8 = matches!(
+                src.texture_descriptor.format,
+                TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
+            );
+            let Some(data) = src.data.as_ref().filter(|d| rgba8 && d.len() >= (w * h * 4) as usize) else {
                 return;
             };
-            if data.len() < (w * h * 4) as usize {
-                return;
-            }
             let (dw, dh) = (w / 2, h / 2);
             let mut out = vec![0u8; (dw * dh * 4) as usize];
             for y in 0..dh {
@@ -418,6 +420,26 @@ fn clouds(
                     }
                 }
             }
+            silhouettes.push((dw, dh, out));
+        }
+        st.materials.clear();
+        st.meshes.clear();
+        // horizontal quad 576×256 px (image top = north), shared by every variant
+        let (hw, hh) = (288.0 * PX, 128.0 * PX);
+        let quad = meshes.add(
+            Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+                .with_inserted_attribute(
+                    Mesh::ATTRIBUTE_POSITION,
+                    vec![[-hw, 0.0, hh], [hw, 0.0, hh], [hw, 0.0, -hh], [-hw, 0.0, -hh]],
+                )
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; 4])
+                .with_inserted_attribute(
+                    Mesh::ATTRIBUTE_UV_0,
+                    vec![[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                )
+                .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3])),
+        );
+        for (dw, dh, out) in silhouettes {
             let mut img = Image::new(
                 Extent3d {
                     width: dw,
@@ -438,20 +460,7 @@ fn clouds(
                 cull_mode: None,
                 ..default()
             }));
-            // horizontal quad 576×256 px (image top = north)
-            let (hw, hh) = (288.0 * PX, 128.0 * PX);
-            let m = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
-                .with_inserted_attribute(
-                    Mesh::ATTRIBUTE_POSITION,
-                    vec![[-hw, 0.0, hh], [hw, 0.0, hh], [hw, 0.0, -hh], [-hw, 0.0, -hh]],
-                )
-                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; 4])
-                .with_inserted_attribute(
-                    Mesh::ATTRIBUTE_UV_0,
-                    vec![[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-                )
-                .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
-            st.meshes.push(meshes.add(m));
+            st.meshes.push(quad.clone());
         }
     }
     if st.generation != Some(mirror.generation) {

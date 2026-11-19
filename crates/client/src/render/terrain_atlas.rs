@@ -434,17 +434,34 @@ pub fn rgba_mips(base: &[u8], n: usize, levels: u32) -> Vec<u8> {
     out
 }
 
+/// Layer count actually allocated for an array of `n` layers. WebGL2 (wgpu-hal GLES) must fix the texture target at
+/// creation and guesses it from the layer count: `n == 6` → cube, `n > 6 && n % 6 == 0` → cube array. A 2D array
+/// with such a count (228 here!) gets the wrong target and samples garbage, so pad it with spare layers.
+pub fn gl_safe_layers(n: usize) -> usize {
+    let mut n = n.max(2);
+    while n % 6 == 0 {
+        n += 1;
+    }
+    n
+}
+
 /// Assembles the layers into a mip-mapped 2D array texture (`texture_2d_array` in the shader).
 pub fn array_image(layers: &[Layer]) -> Image {
-    let mut data = Vec::with_capacity(layers.len() * TILE_PX * TILE_PX * 4 * 4 / 3 + 64);
+    let count = gl_safe_layers(layers.len());
+    let mut data = Vec::with_capacity(count * TILE_PX * TILE_PX * 4 * 4 / 3 + 64);
     for l in layers {
         data.extend(rgba_mips(l, TILE_PX, MIPS));
+    }
+    // spare (never sampled) layers keep the GL texture target a 2D array
+    let blank = vec![0u8; TILE_PX * TILE_PX * 4];
+    for _ in layers.len()..count {
+        data.extend(rgba_mips(&blank, TILE_PX, MIPS));
     }
     let mut img = Image::new_uninit(
         Extent3d {
             width: TILE_PX as u32,
             height: TILE_PX as u32,
-            depth_or_array_layers: layers.len() as u32,
+            depth_or_array_layers: count as u32,
         },
         TextureDimension::D2,
         TextureFormat::Rgba8UnormSrgb,
@@ -472,22 +489,37 @@ pub fn array_image(layers: &[Layer]) -> Image {
 mod tests {
     use super::*;
 
-    #[test]
-    fn layer_indices_are_distinct_and_in_range() {
-        let mut seen = std::collections::BTreeSet::new();
+    fn all_layers() -> (Vec<u32>, Vec<u32>) {
+        let mut opaque = Vec::new();
+        let mut overlays = Vec::new();
         for s in 0..SURF_N {
             for m in 0..16 {
-                assert!(seen.insert(top_layer(s, m)));
+                opaque.push(top_layer(s, m));
+                if let Some(l) = flat_layer(s, m) {
+                    overlays.push(l);
+                }
             }
-            assert!(seen.insert(ramp_layer(s)));
+            opaque.push(ramp_layer(s));
         }
         for k in [WallKind::Plain, WallKind::Foot, WallKind::Wet] {
             for c in [WallCap::Left, WallCap::Mid, WallCap::Right, WallCap::Pillar] {
-                assert!(seen.insert(wall_layer(k, c)));
+                opaque.push(wall_layer(k, c));
             }
+        }
+        (opaque, overlays)
+    }
+
+    #[test]
+    fn layer_indices_are_distinct_and_in_range() {
+        let (opaque, overlays) = all_layers();
+        let mut seen = std::collections::BTreeSet::new();
+        for l in opaque.iter().chain(&overlays) {
+            assert!(seen.insert(*l), "layer {l} used twice");
         }
         assert_eq!(seen.len(), LAYERS as usize);
         assert!(seen.iter().all(|&l| l < LAYERS));
+        // WebGL2 guarantees only 256 array layers
+        assert!(LAYERS <= 256);
     }
 
     #[test]
@@ -501,9 +533,16 @@ mod tests {
         let sheets = [sh(), sh(), sh(), sh(), sh()];
         let layers = build_layers(&sheets);
         assert_eq!(layers.len(), LAYERS as usize);
-        assert!(layers.iter().all(|l| l.chunks_exact(4).all(|p| p[3] == 255)));
+        // faces are opaque; only the overlay tiles have transparent texels
+        let (opaque, _) = all_layers();
+        for l in opaque {
+            assert!(layers[l as usize].chunks_exact(4).all(|p| p[3] == 255), "layer {l} not opaque");
+        }
         let img = array_image(&layers);
-        let expect: usize = (0..MIPS).map(|m| (64usize >> m).max(1).pow(2) * 4).sum::<usize>() * LAYERS as usize;
+        let count = gl_safe_layers(LAYERS as usize);
+        assert!(count % 6 != 0 && count <= 256);
+        assert_eq!(img.texture_descriptor.size.depth_or_array_layers as usize, count);
+        let expect: usize = (0..MIPS).map(|m| (64usize >> m).max(1).pow(2) * 4).sum::<usize>() * count;
         assert_eq!(img.data.as_ref().map(|d| d.len()), Some(expect));
     }
 }

@@ -71,8 +71,9 @@ fn fragment(
     out = deferred_output(in, pbr_input);
 } @else {
     out.color = apply_pbr_lighting(pbr_input);
-    out.color = vec4<f32>(fog_of_war(out.color.rgb, fog_s), out.color.a);
+    // distance fog (and in-shader tonemapping) first: unexplored ground stays very dark, without haze on it
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    out.color = vec4<f32>(fog_of_war(out.color.rgb, fog_s), out.color.a);
 }
     return out;
 }

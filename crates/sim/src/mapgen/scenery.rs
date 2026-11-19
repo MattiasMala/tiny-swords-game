@@ -180,11 +180,19 @@ impl Gen {
         let weight = |g: &Gen, c: i32| {
             if g.used_around(c, 4) >= 3 || g.edge0[c as usize] <= 5 { 1.0 } else { 0.3 }
         };
+        // camps keep ≥ 14 cells from each other (the props of one camp must not attract the next)
+        let mut sites: Vec<(i32, i32)> = Vec::new();
         for i in 0..36 {
-            let c = self.spot_w(300, &room3, &weight);
+            let taken = sites.clone();
+            let spaced = move |g: &Gen, c: i32| {
+                let (x, y) = (c % W, c / W);
+                room3(g, c) && taken.iter().all(|s| (s.0 - x).pow(2) + (s.1 - y).pow(2) >= 14 * 14)
+            };
+            let c = self.spot_w(300, &spaced, &weight);
             if c < 0 {
                 continue;
             }
+            sites.push((c % W, c / W));
             self.solid_prop(P::Tent, c - W);
             self.solid_prop(P::Campfire, c + 1);
             self.solid_prop([P::Barrel, P::Crate, P::Logs][i % 3], c - W + 1);

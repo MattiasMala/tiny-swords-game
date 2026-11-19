@@ -12,7 +12,12 @@
 //     every frame for what is in view.
 //   * `Flavor`: `Lit` alpha mask, lit, casts shadows · `LitFlat` same without shadow casting (flat props, decals) ·
 //     `Translucent` lit alpha blend (construction ghosts, depleted nodes, placement ghost) · `Overlay` unlit blend
-//     (rings, bars, brackets, pennants) · `Glow` additive (night halos).
+//     (rings, bars, brackets, pennants) · `Glow` additive (night halos) · `Shadow` shadow casters only (below).
+// * Shadows: a leaning billboard would cast a thin sliver (the sun is behind it, on the north side). Every `Lit` quad
+//   therefore also emits a VERTICAL, unstretched proxy quad (same frame, same size in sprite px) into the `Shadow`
+//   batches, which live on the shadow-only render layer: the sun sees them, the camera does not. A vertical plane
+//   facing south under the light ray `(lx, -1, ly)` projects exactly like the 2D `Light.shadows` shear (silhouette
+//   squashed by `ly`, sheared by `lx`, spec 07 §3). The visible billboards cast nothing themselves.
 // * Billboards (Octopath style): quads facing the camera yaw, leaning back by `LEAN` × the camera pitch and stretched
 //   vertically by `1 / cos(pitch − lean)` so the projected pixel art keeps its native proportions (not foreshortened)
 //   while staying upright enough not to sink into cliffs behind them. Content BELOW the anchor (ripples, feet) is
@@ -29,7 +34,8 @@ use crate::render::camera::{CameraRig, RtsCamera};
 use crate::render::consts::PX;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
-use bevy::light::NotShadowCaster;
+use bevy::camera::visibility::RenderLayers;
+use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -180,8 +186,10 @@ pub enum Flavor {
     Overlay = 3,
     /// additive, unlit (halos)
     Glow = 4,
+    /// vertical shadow-caster proxies of `Lit` quads (shadow-only render layer, filled by `Painter`)
+    Shadow = 5,
 }
-pub const FLAVORS: usize = 5;
+pub const FLAVORS: usize = 6;
 
 /// System sets of the sprite pipeline (Update): prepare (clock, camera basis) → draw (fill batches) → upload.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -256,6 +264,8 @@ pub struct Batch {
     pub mesh: Handle<Mesh>,
     pub buf: QuadBuf,
     last_hash: u64,
+    /// content may have changed since the last upload (set by `clear_layer`)
+    dirty: bool,
     shown: bool,
 }
 
@@ -291,6 +301,7 @@ impl SpriteBatches {
         let start = layer as usize * n;
         for b in self.batches.iter_mut().skip(start).take(n) {
             b.buf.clear();
+            b.dirty = true;
         }
     }
 }
@@ -425,6 +436,41 @@ impl Painter<'_> {
         }
     }
 
+    /// Vertical, unstretched shadow-caster copy of a quad (local px `[x0, x1, ybot, ytop]` around the anchor, y up).
+    /// Rows below the anchor of a grounded sprite are dropped (they lie on / under the ground).
+    #[allow(clippy::too_many_arguments)]
+    fn shadow_proxy(
+        &mut self,
+        layer: Layer,
+        page: usize,
+        foot: Vec3,
+        lift: f32,
+        rect: [f32; 4],
+        mut uv: [f32; 4],
+        flip: bool,
+    ) {
+        let [x0, x1, mut ybot, ytop] = rect;
+        if lift <= 0.0 && ybot < 0.0 {
+            if ytop <= 0.0 {
+                return;
+            }
+            uv[3] = uv[1] + (uv[3] - uv[1]) * (ytop / (ytop - ybot));
+            ybot = 0.0;
+        }
+        let r = self.basis.right;
+        let up = Vec3::Y * PX;
+        let base = foot + up * lift;
+        let c = [
+            base + r * x0 + up * ybot,
+            base + r * x1 + up * ybot,
+            base + r * x1 + up * ytop,
+            base + r * x0 + up * ytop,
+        ];
+        if let Some(buf) = self.batches.buf(layer, page, Flavor::Shadow) {
+            buf.quad(c, uv, [1.0; 4], flip);
+        }
+    }
+
     /// Draws frame `frame` of `sheet` with its anchor on `foot` (world). Returns the drawn frame-space rect.
     pub fn sprite(
         &mut self,
@@ -479,6 +525,9 @@ impl Painter<'_> {
             let buf = self.batches.buf(layer, page, flavor)?;
             buf.quad(c, uv, col, o.flip);
             return Some(r);
+        }
+        if flavor == Flavor::Lit {
+            self.shadow_proxy(layer, page, foot, o.lift, [lx0, lx1, ybot, ytop], uv, o.flip);
         }
         if o.fold && ybot < 0.0 && o.lift <= 0.0 {
             // part above the anchor stands up, the rest lies on the ground towards the camera
@@ -554,7 +603,8 @@ impl Painter<'_> {
         }
     }
 
-    /// A flat world-aligned rect on the ground (footprints): world xz rect at height `y`.
+    /// A flat world-aligned rect on the ground (footprints): world xz rect at height `y`, optionally pulled `pull` world
+    /// units towards the camera (drawn over the sprites around it, like the 2D overlays).
     pub fn ground_rect(
         &mut self,
         layer: Layer,
@@ -566,14 +616,16 @@ impl Painter<'_> {
         z1: f32,
         y: f32,
         color: [f32; 4],
+        pull: f32,
     ) {
         let Some((_, uv)) = f.full() else { return };
-        let q = [
+        let mut q = [
             Vec3::new(x0, y, z1),
             Vec3::new(x1, y, z1),
             Vec3::new(x1, y, z0),
             Vec3::new(x0, y, z0),
         ];
+        self.pull_corners(&mut q, pull);
         if let Some(buf) = self.batches.buf(layer, f.page as usize, flavor) {
             buf.quad(q, uv, color, false);
         }
@@ -616,62 +668,6 @@ impl Painter<'_> {
         }
     }
 }
-
-/// Fog access for the renderers (explored = known; visible = currently seen).
-pub struct FogView<'a> {
-    pub explored: &'a ts_sim::math::BitGrid,
-    pub visible: Option<&'a [u8]>,
-    pub w: i32,
-    pub h: i32,
-    pub off: bool,
-}
-
-impl FogView<'_> {
-    #[inline]
-    pub fn cell(&self, x: f32, y: f32) -> Option<usize> {
-        let cx = (x / TILE).floor() as i32;
-        let cy = (y / TILE).floor() as i32;
-        if cx < 0 || cy < 0 || cx >= self.w || cy >= self.h {
-            return None;
-        }
-        Some((cy * self.w + cx) as usize)
-    }
-
-    /// `Fog.knows`: the cell has been explored.
-    #[inline]
-    pub fn knows(&self, x: f32, y: f32) -> bool {
-        if self.off {
-            return true;
-        }
-        self.cell(x, y).is_some_and(|c| self.explored.get(c))
-    }
-
-    /// `Fog.sees`: the cell is currently visible.
-    #[inline]
-    pub fn sees(&self, x: f32, y: f32) -> bool {
-        if self.off {
-            return true;
-        }
-        match (self.cell(x, y), self.visible) {
-            (Some(c), Some(v)) => v.get(c).is_some_and(|&s| s != 0),
-            (Some(c), None) => self.explored.get(c),
-            _ => false,
-        }
-    }
-
-    /// Colour multiplier: full in sight, dimmed under fog (`shade 0.42` towards navy, spec 07 §8.2 step 14).
-    #[inline]
-    pub fn tint(&self, x: f32, y: f32) -> [f32; 4] {
-        if self.sees(x, y) {
-            [1.0, 1.0, 1.0, 1.0]
-        } else {
-            FOG_TINT
-        }
-    }
-}
-
-/// Fogged (explored, not visible) colour multiplier.
-pub const FOG_TINT: [f32; 4] = [0.6, 0.62, 0.7, 1.0];
 
 /// Ground height (world units) under a sim point (px).
 #[inline]
@@ -757,14 +753,27 @@ fn ensure_batches(
     let pages = atlas.pages.len();
     batches.pages = pages;
     batches.lit = true;
-    let mut mats = Vec::with_capacity(pages * FLAVORS);
+    let mut mats: Vec<Handle<StandardMaterial>> = Vec::with_capacity(pages * FLAVORS);
     for page in &atlas.pages {
         for fl in 0..FLAVORS {
+            if fl == Flavor::Shadow as usize {
+                // shadow proxies share the `Lit` material (same pipeline, only the shadow pass sees them)
+                let lit = mats[mats.len() - fl].clone();
+                mats.push(lit);
+                continue;
+            }
             let (alpha_mode, unlit) = match fl {
                 0 | 1 => (AlphaMode::Mask(0.5), false),
                 2 => (AlphaMode::Blend, false),
                 3 => (AlphaMode::Blend, true),
                 _ => (AlphaMode::Add, true),
+            };
+            // every batch mesh sits at the origin, so the transparent phase cannot sort them by distance: the bias
+            // fixes the order translucent sprites → glow halos → overlays (bars, rings, footprints stay on top)
+            let depth_bias = match fl {
+                3 => 200.0,
+                4 => 100.0,
+                _ => 0.0,
             };
             mats.push(materials.add(StandardMaterial {
                 base_color: Color::WHITE,
@@ -777,6 +786,7 @@ fn ensure_batches(
                 metallic: 0.0,
                 reflectance: 0.0,
                 fog_enabled: fl != 3 && fl != 4,
+                depth_bias,
                 ..default()
             }));
         }
@@ -793,7 +803,12 @@ fn ensure_batches(
                     NoFrustumCulling,
                     Name::new(format!("sprites l{layer} p{page} f{fl}")),
                 ));
-                if fl != 0 {
+                if fl == Flavor::Shadow as usize {
+                    e.insert((
+                        RenderLayers::layer(crate::render::fx::SHADOW_ONLY_LAYER),
+                        NotShadowReceiver,
+                    ));
+                } else {
                     e.insert(NotShadowCaster);
                 }
                 let entity = e.id();
@@ -802,6 +817,7 @@ fn ensure_batches(
                     mesh,
                     buf: QuadBuf::default(),
                     last_hash: 0,
+                    dirty: true,
                     shown: false,
                 });
             }
@@ -881,6 +897,11 @@ fn upload_batches(
     mut vis: Query<&mut Visibility>,
 ) {
     for b in batches.batches.iter_mut() {
+        // untouched since the last upload (static layer between rebuilds): nothing to hash or send
+        if !b.dirty {
+            continue;
+        }
+        b.dirty = false;
         let empty = b.buf.idx.is_empty();
         if empty {
             if b.shown {

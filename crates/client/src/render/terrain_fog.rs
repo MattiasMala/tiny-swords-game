@@ -41,6 +41,8 @@ pub struct FogTexture {
     pub shade: Vec<f32>,
     timer: f32,
     settled: bool,
+    /// texel bytes last uploaded (`shade × 255`): the texture is re-uploaded only when one of them changes
+    bytes: Vec<u8>,
     generation: Option<u32>,
     /// dev switch (native env `TS_NOFOG=1`): render without fog of war
     dev_off: bool,
@@ -136,6 +138,7 @@ pub fn init_fog(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         shade: vec![1.0; n],
         timer: 0.0,
         settled: false,
+        bytes: vec![255; n],
         generation: None,
         dev_off: dev_fog_off(),
     });
@@ -149,7 +152,8 @@ pub fn update_fog(
     mut images: ResMut<Assets<Image>>,
 ) {
     let fog = fog.bypass_change_detection();
-    let dt = time.delta_secs().min(0.25);
+    // presentation timers use the real frame dt clamped like the JS main loop (spec 05 §17.2: 0.05 s)
+    let dt = time.delta_secs().min(0.05);
     let mut dirty = false;
     if fog.generation != Some(mirror.generation) {
         fog.generation = Some(mirror.generation);
@@ -172,6 +176,7 @@ pub fn update_fog(
         }
         let n = (fog.w * fog.h) as usize;
         fog.shade = vec![1.0; n];
+        fog.bytes = vec![255; n];
         fog.visible.clear();
         fog.explored.clear();
         fog.timer = 0.0;
@@ -214,19 +219,24 @@ pub fn update_fog(
                 all = false;
             }
             fog.shade[c] = s;
-            dirty = true;
+            let b = (s * 255.0).round() as u8;
+            if let Some(old) = fog.bytes.get_mut(c)
+                && *old != b
+            {
+                *old = b;
+                dirty = true;
+            }
         }
         fog.settled = all;
     }
+    // upload only when a texel byte changed (the asset change re-writes the GPU texture in place)
     if dirty && let Some(mut img) = images.get_mut(&fog.image) {
-        let n = fog.shade.len();
+        let n = fog.bytes.len();
         if let Some(data) = img.data.as_mut() {
             if data.len() != n {
                 data.resize(n, 255);
             }
-            for (d, s) in data.iter_mut().zip(&fog.shade) {
-                *d = (s * 255.0).round() as u8;
-            }
+            data.copy_from_slice(&fog.bytes);
         }
     }
 }

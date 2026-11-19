@@ -15,8 +15,9 @@
 // * `UiSet` system set (Update): world input should run `.after(UiSet)` or simply read last frame's flags.
 // * Solo pause: `UiState::sim_paused()` is true while the solo match must not advance (pause menu / help, spec 05
 //   §15.1); the local room driver should honour it.
-// * Dev (native): env `TS_UI_SCREEN=unita|invia|lavoratori|ricerche|mercato|costruisci|test|help|pause` opens that
-//   screen once the match is running (screenshots).
+// * Dev (native, screenshots): env `TS_UI_SCREEN` = comma list of `unita|invia|lavoratori|ricerche|mercato|costruisci|
+//   test|help|pause|fog|gift|toast|alert|win|lose|spectate`, applied once the match runs; `TS_UI_MOUSE=x,y` pins the UI
+//   pointer (hover states, tooltips); `TS_UI_WIN=WxH` sets the window to W×H logical px (scale factor 1).
 
 pub mod hud;
 pub mod kit;
@@ -299,6 +300,7 @@ impl Plugin for UiPlugin {
             .add_systems(
                 Update,
                 (
+                    dev_window,
                     track_match,
                     consume_events,
                     minimap::update_layers,
@@ -342,6 +344,7 @@ pub struct Env<'w, 's> {
     pub sel: ResMut<'w, Selection>,
     pub place: ResMut<'w, Placement>,
     pub ctl: MessageWriter<'w, ControlAction>,
+    pub marks: ResMut<'w, crate::control::Markers>,
     pub cams: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<RtsCamera>>,
     pub gfx: Res<'w, UiGfx>,
 }
@@ -385,6 +388,7 @@ pub struct Core<'w, 's> {
     pub lcx: ResMut<'w, LayoutCx>,
     pub fonts: Res<'w, Assets<Font>>,
     pub ga: Res<'w, GameAssets>,
+    pub atlas: Res<'w, crate::assets::SpriteAtlas>,
     pub windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     pub mouse: Res<'w, ButtonInput<MouseButton>>,
     pub keys: Res<'w, ButtonInput<KeyCode>>,
@@ -412,6 +416,7 @@ fn track_match(
     time: Res<Time<Real>>,
     mut sel: ResMut<Selection>,
     mut place: ResMut<Placement>,
+    lobby: Res<LobbyState>,
 ) {
     let dt = time.delta_secs();
     if *state.get() != AppState::InGame {
@@ -442,7 +447,7 @@ fn track_match(
         }
     }
     // toast / banners / pings timers (`updateView`; frozen while the solo game is paused)
-    let solo_paused = st.sim_paused() && mirror.you.is_some();
+    let solo_paused = st.sim_paused() && !lobby.remote;
     if !solo_paused {
         st.toast_t = (st.toast_t - dt).max(0.0);
         if let Some(b) = st.banners.front_mut() {
@@ -522,6 +527,9 @@ fn consume_events(
     let me = st.player_color.unwrap_or(KingdomColor::Blue);
     let color_of = |f: FactionIdx| mirror.colors.get(f as usize).copied().unwrap_or(me);
     for GameEventMsg(e) in events.read() {
+        if !e.is_for(mirror.you) {
+            continue;
+        }
         match e {
             GameEvent::Toast { msg, .. } => {
                 let t = msg.text();
@@ -587,15 +595,60 @@ fn emit_sounds(mut st: ResMut<UiState>, mut out: MessageWriter<GameEventMsg>, mi
     }
 }
 
-/// Native dev helper: `TS_UI_SCREEN` opens a screen once the match runs.
-fn dev_screen() -> Option<String> {
+/// Native dev helper: `TS_UI_MOUSE=x,y` pins the UI pointer (screenshots of hover states and tooltips).
+fn dev_mouse() -> Option<Vec2> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::env::var("TS_UI_SCREEN").ok()
+        static V: std::sync::OnceLock<Option<Vec2>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let v = std::env::var("TS_UI_MOUSE").ok()?;
+            let (x, y) = v.split_once(',')?;
+            Some(Vec2::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+        })
     }
     #[cfg(target_arch = "wasm32")]
     {
         None
+    }
+}
+
+/// Native dev helper: `TS_UI_SCREEN` opens a screen once the match runs.
+fn dev_screen() -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // read once (this is asked every frame until a match runs)
+        static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        V.get_or_init(|| std::env::var("TS_UI_SCREEN").ok()).clone()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// Native dev helper: `TS_UI_WIN=WxH` resizes the window once (screenshots at other resolutions).
+fn dev_window(mut windows: Query<&mut Window, With<PrimaryWindow>>, mut done: Local<bool>) {
+    if *done {
+        return;
+    }
+    *done = true;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some((w, h)) = std::env::var("TS_UI_WIN").ok().and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        }) else {
+            return;
+        };
+        if let Ok(mut win) = windows.single_mut() {
+            // logical size = physical size (UI scale formulas see exactly W×H)
+            win.resolution.set_scale_factor_override(Some(1.0));
+            win.resolution.set_physical_resolution(w, h);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = &mut windows;
     }
 }
 
@@ -605,15 +658,19 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
         return;
     };
     let (w, h) = (window.width(), window.height());
-    let cursor = window.cursor_position();
+    let cursor = dev_mouse().or(window.cursor_position());
     let mouse = cursor.unwrap_or(core.last_mouse.unwrap_or(Vec2::splat(-1.0)));
     let moved = match (*core.last_mouse, cursor) {
-        (Some(a), Some(b)) => (a - b).length() > 2.0,
+        (Some(a), Some(b)) => (a - b).abs().element_sum() > 2.0,
         (None, Some(_)) => true,
         _ => false,
     };
     if cursor.is_some() {
         *core.last_mouse = cursor;
+    }
+    if moved {
+        // main.js:180: the mouse takes over from the keyboard focus
+        core.paint.kbd = false;
     }
     let io = Io {
         w,
@@ -632,6 +689,10 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
     let app_state = *env.state.get();
     let in_game = app_state == AppState::InGame && env.mirror.active;
     let in_menu = matches!(app_state, AppState::Menu | AppState::Lobby);
+    if app_state == AppState::Menu {
+        // back on the main menu (left / dropped lobby): a later lobby must show INIZIA again
+        st.starting = false;
+    }
     if app_state == AppState::Loading {
         core.paint.begin(io);
         core.paint.end();
@@ -647,7 +708,8 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
         && let Some(name) = dev_screen()
     {
         *core.dev_screen = Some(env.mirror.generation);
-        match name.as_str() {
+        for name in name.split(',').map(str::trim) {
+        match name {
             "unita" => st.open(Screen::Unita),
             "lavoratori" => st.open(Screen::Lavoratori),
             "ricerche" => st.open(Screen::Ricerche),
@@ -656,6 +718,26 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
             "test" => st.open(Screen::Test),
             "help" => st.help = true,
             "pause" => st.paused = true,
+            "fog" => env.command(ts_sim::cmd::Command::DebugFogOff { on: true }),
+            "gift" => env.command(ts_sim::cmd::Command::DebugGift { res: None }),
+            "toast" => st.toast("Risorse insufficienti"),
+            "alert" => {
+                let p = env.rig.focus;
+                st.pings.push((p.x, p.y, 0.0));
+                st.alert_at = Some(p);
+                st.alert_t = env.mirror.view.time;
+                let c = make_view(&env, &st).color;
+                st.announce("Il tuo regno è sotto attacco!".to_string(), c, 30.0);
+            }
+            "win" | "lose" => {
+                st.result = Some(if name == "win" { MatchResult::Win } else { MatchResult::Lose });
+                st.end_time = env.mirror.view.time;
+                st.over = true;
+            }
+            "spectate" => {
+                st.result = Some(MatchResult::Lose);
+                st.spectate = true;
+            }
             "invia" => {
                 let ids: Vec<UnitId> = env
                     .mirror
@@ -675,6 +757,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
                 st.screen = Some(Screen::Invia);
             }
             _ => {}
+        }
         }
         st.fresh = false;
     }
@@ -721,6 +804,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
         if confirm {
             // `UI.press()`
             if st.screen == Some(Screen::Invia)
+                && !st.help
                 && let Some(s) = st.send.as_mut()
                 && s.kbd
             {
@@ -759,7 +843,13 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
                     };
                     st.fresh = true;
                 } else if st.paused {
-                    st.paused = false;
+                    // placement / click mode are cancelled before the pause toggles (the world input ignores
+                    // keys under the pause menu); a selection does not count while paused
+                    if env.place.active() {
+                        env.place.cancel();
+                    } else {
+                        st.paused = false;
+                    }
                 } else if env.place.active() || !env.sel.is_empty() {
                     // placement / mode / selection: control (C4) cancels them
                     st.esc_consumed = false;
@@ -782,6 +872,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
                 if !st.spectate {
                     st.open(Screen::Test);
                     env.place.cancel();
+                    core.paint.focus = None;
                 }
             } else {
                 st.say(Some(ts_sim::cmd::SOLO_TEST_MODE.to_string()));
@@ -802,6 +893,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
         if let Some(s) = scr {
             st.open(s);
             env.place.cancel();
+            core.paint.focus = None;
         }
     }
 
@@ -813,6 +905,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
         lcx,
         fonts,
         ga,
+        atlas,
         ..
     } = &mut core;
     paint.begin(io);
@@ -827,10 +920,16 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
                 font,
             },
             ga,
+            atlas,
             sounds: &mut sounds,
         };
         if in_menu {
-            menu::draw_menu(&mut u, &mut st, &mut env);
+            let dev_lobby = app_state == AppState::Menu
+                && dev_screen().is_some_and(|l| l.split(',').any(|n| n.trim() == "lobby"));
+            if dev_lobby {
+                menu::dev_fake_lobby(&mut env);
+            }
+            menu::draw_menu(&mut u, &mut st, &mut env, dev_lobby);
         } else if in_game {
             let view = make_view(&env, &st);
             u.p.locked = st.paused || st.help || st.over || st.screen.is_some();
@@ -839,7 +938,8 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
             } else {
                 hud::draw_hud(&mut u, &mut st, &mut env, &view);
             }
-            u.p.locked = false;
+            // the help overlay (drawn last) owns the input: the modal under it is not clickable / focusable
+            u.p.locked = st.help;
             if st.over {
                 overlays::draw_game_over(&mut u, &mut st, &mut env, &view);
             } else if st.paused {
@@ -878,6 +978,7 @@ fn ui_frame(mut core: Core, mut st: ResMut<UiState>, mut env: Env) {
 /// `UI.navigate(dx, dy)`.
 fn navigate(p: &mut Paint, st: &mut UiState, dx: f32, dy: f32, env: &Env) {
     if st.screen == Some(Screen::Invia)
+        && !st.help
         && let Some(s) = st.send.as_mut()
     {
         let (mw, mh) = env
@@ -941,11 +1042,11 @@ fn apply_cursor(
         CursorKind::Arrow => (format!("{}Cursors/Cursor_01.png", kit::UIP), (23, 18)),
         CursorKind::Hand => (format!("{}Cursors/Cursor_02.png", kit::UIP), (27, 19)),
         CursorKind::No => (format!("{}Cursors/Cursor_03.png", kit::UIP), (32, 31)),
-        CursorKind::Attack => (kit::ui_icon(5), (22, 22)),
-        CursorKind::Axe => ("Terrain/Resources/Tools/Tool_02.png".to_string(), (26, 26)),
-        CursorKind::Pick => ("Terrain/Resources/Tools/Tool_04.png".to_string(), (26, 26)),
-        CursorKind::Knife => ("Terrain/Resources/Tools/Tool_03.png".to_string(), (26, 26)),
-        CursorKind::Hammer => ("Terrain/Resources/Tools/Tool_01.png".to_string(), (26, 26)),
+        CursorKind::Attack => (kit::ui_icon(5), (18, 18)),
+        CursorKind::Axe => ("Terrain/Resources/Tools/Tool_02.png".to_string(), (28, 28)),
+        CursorKind::Pick => ("Terrain/Resources/Tools/Tool_04.png".to_string(), (28, 28)),
+        CursorKind::Knife => ("Terrain/Resources/Tools/Tool_03.png".to_string(), (28, 28)),
+        CursorKind::Hammer => ("Terrain/Resources/Tools/Tool_01.png".to_string(), (28, 28)),
     };
     let Some(handle) = ga.image(&path) else {
         return;

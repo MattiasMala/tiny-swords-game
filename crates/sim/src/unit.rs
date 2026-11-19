@@ -6,6 +6,9 @@
 // idle (§5.1), move_unit / approach / travel / nav_to / field_of (§7.1-7.3), hold_post, eject rule (§7.4),
 // update_scout + frontier (§12.1), unit_act / job_of, remove_dead_units.
 // RNG: only `World.rng` (thinkT, fearT staggering); `animT` and running-dust randomness are client-side (U6).
+// Deviation (perf): `approach` also walks straight to goals >= 280 px away when `open_corridor` holds (one free,
+// level cell around the whole segment), instead of computing a distance field per goal cell — mass marches
+// otherwise thrash the 128-entry field cache (measured: 500-unit battle 6.7 s → 0.67 s for 1200 ticks).
 
 use crate::World;
 use crate::defs::*;
@@ -297,18 +300,21 @@ impl World {
     pub fn move_unit(&mut self, id: UnitId, to: V2) {
         let Some(u) = self.units.get(id) else { return };
         let d = u.pos.dist(to);
-        if d < 0.5 {
+        // `!(d >= 0.5)` also rejects a NaN goal (would poison the position forever)
+        if !(d >= 0.5) || !d.is_finite() {
             return;
         }
         let step = d.min(u.speed * TICK_DT);
+        // facing comes from the offset BEFORE the step (JS `dx = tx - u.x`), not from what is left after it
+        let dx = to.x - u.pos.x;
         let delta = (to - u.pos) * (step / d);
         let np = self
             .map
             .try_move(u.pos, delta.x, delta.y, side_of(u.faction), u.cross);
         let u = self.units.get_mut(id).expect("checked");
         u.pos = np;
-        if (to.x - u.pos.x).abs() > 4.0 {
-            u.flip = to.x < u.pos.x;
+        if dx.abs() > 4.0 {
+            u.flip = dx < 0.0;
         }
         u.moving = true;
     }
@@ -361,6 +367,12 @@ impl World {
             self.move_unit(id, to);
             return true;
         }
+        // Rust addition (perf, see `open_corridor`): far goals across open, level ground are walked straight
+        // instead of through a per-goal distance field (the field route there is the same straight run).
+        if d >= CLEARLINE_DIST && self.open_corridor(from, to, side) {
+            self.move_unit(id, to);
+            return true;
+        }
         let b = self.map.cell_of(to);
         if b < 0 {
             return false;
@@ -383,6 +395,51 @@ impl World {
         }
         let to = self.map.center(n);
         self.move_unit(id, to);
+        true
+    }
+
+    /// Straight run from `a` to `b` with one free cell on every side: every cell within one cell (3x3) of every
+    /// cell the segment crosses is passable for `side`, on the level of `a`'s cell and not a stair. Then
+    /// `try_move` (9 px probe, `cross = false`) can never be stopped by terrain or buildings along the segment,
+    /// and the distance field toward `b` would lead the same way. Used by `approach` for goals ≥ 280 px away: in
+    /// big battles hundreds of marching units each want a field to their own formation slot and the 128-entry
+    /// field cache thrashes (≈80 full-map recomputes per tick with 500 units); this keeps open-ground marches
+    /// field-free. Cost: one 3x3 check per crossed cell (samples every 32 px, early exit at the first miss).
+    pub fn open_corridor(&self, a: V2, b: V2, side: u8) -> bool {
+        let m = &self.map;
+        let ca = m.cell_of(a);
+        if ca < 0 || m.cell_of(b) < 0 {
+            return false;
+        }
+        let lvl = m.level_at(ca);
+        let d = a.dist(b);
+        if !d.is_finite() {
+            return false;
+        }
+        let n = (d / 32.0).ceil().max(1.0) as i32;
+        let mut last = -1;
+        for i in 0..=n {
+            let c = m.cell_of(a.lerp(b, i as f32 / n as f32));
+            if c == last {
+                continue;
+            }
+            last = c;
+            if c < 0 {
+                return false;
+            }
+            let (cx, cy) = (c % m.w, c / m.w);
+            for y in cy - 1..=cy + 1 {
+                for x in cx - 1..=cx + 1 {
+                    if x < 0 || y < 0 || x >= m.w || y >= m.h {
+                        return false;
+                    }
+                    let k = y * m.w + x;
+                    if !m.passable(k, side) || m.level_at(k) != lvl || m.is_stair(k) {
+                        return false;
+                    }
+                }
+            }
+        }
         true
     }
 

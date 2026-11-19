@@ -1,7 +1,7 @@
 //! Drawing primitives and widgets of the original UI (spec 06 §2: assets.js + ui.js:128-170), on top of `Paint`.
 
 use super::paint::{Align, Hit, Measure, OUTLINE, Paint, Tip};
-use crate::assets::GameAssets;
+use crate::assets::{ATLAS_PAGE, GameAssets, SpriteAtlas};
 use bevy::prelude::*;
 use ts_sim::defs::{
     AGE_SHORT, BuildingKind, Cost, KingdomColor, PointKind, Res, Sound, TechIcon, UnitKind,
@@ -189,6 +189,8 @@ pub struct Ui<'a> {
     pub p: &'a mut Paint,
     pub m: Measure<'a>,
     pub ga: &'a GameAssets,
+    /// packed world sprites (unit sheets are only there, spec C2 header of assets.rs)
+    pub atlas: &'a SpriteAtlas,
     pub sounds: &'a mut Vec<Sound>,
 }
 
@@ -488,47 +490,100 @@ impl Ui<'_> {
             return;
         }
         let path = unit_idle_sheet(c, k);
-        let Some(e) = self.ga.entry(&path) else {
+        let Some((fw, fh, _, ay, _)) = self.sheet_info(&path) else {
             return;
         };
-        let (fw, fh) = (e.fw as f32, e.fh as f32);
-        let ay = e.ay.unwrap_or(fh * 0.9);
         let side = fw.min(fh) * 0.86;
         let sx = (fw - side) / 2.0;
         let sy = ay - side * 0.9;
-        self.draw(
+        let kk = size.round() / side;
+        self.sheet_part(
             &path,
-            Some(Rect::new(sx, sy, sx + side, sy + side)),
-            x.round(),
-            y.round(),
-            size.round(),
-            size.round(),
+            0,
+            Rect::new(sx, sy, sx + side, sy + side),
+            x.round() - sx * kk,
+            y.round() - sy * kk,
+            kk,
+        );
+    }
+
+    /// `(fw, fh, ax, ay, frames)` of a sprite sheet (atlas first, then the manifest).
+    pub fn sheet_info(&self, path: &str) -> Option<(f32, f32, f32, f32, usize)> {
+        if let Some(id) = self.atlas.sheet_id(path) {
+            let sh = self.atlas.sheet(id);
+            return Some((sh.fw, sh.fh, sh.ax, sh.ay, sh.frames.max(1) as usize));
+        }
+        let e = self.ga.entry(path)?;
+        let (fw, fh) = (e.fw as f32, e.fh as f32);
+        Some((
+            fw,
+            fh,
+            e.ax.unwrap_or(fw / 2.0),
+            e.ay.unwrap_or(fh * 0.9),
+            e.frames.max(1) as usize,
+        ))
+    }
+
+    /// Draws the part `src` (frame-space px) of frame `frame` of a sheet; the frame's origin lands at `(ox, oy)` and
+    /// one frame pixel is `k` screen px. World sheets are read from the packed atlas (their own images are dropped
+    /// after packing), the others from their image.
+    pub fn sheet_part(&mut self, path: &str, frame: usize, src: Rect, ox: f32, oy: f32, k: f32) {
+        if self.atlas.ready
+            && let Some(id) = self.atlas.sheet_id(path)
+        {
+            let f = *self.atlas.frame(id, frame as i64);
+            if let Some(([x0, y0, x1, y1], [u0, v0, u1, v1])) =
+                f.sub(src.min.x, src.min.y, src.max.x, src.max.y)
+                && let Some(page) = self.atlas.pages.get(f.page as usize).cloned()
+            {
+                let p = ATLAS_PAGE as f32;
+                self.p.image(
+                    &page,
+                    Some(Rect::new(u0 * p, v0 * p, u1 * p, v1 * p)),
+                    ox + x0 * k,
+                    oy + y0 * k,
+                    (x1 - x0) * k,
+                    (y1 - y0) * k,
+                    Color::WHITE,
+                );
+            }
+            return;
+        }
+        if crate::assets::use_of(path) == crate::assets::Use::World {
+            return;
+        }
+        let Some((fw, _, _, _, _)) = self.sheet_info(path) else {
+            return;
+        };
+        let sx = frame as f32 * fw;
+        self.draw(
+            path,
+            Some(Rect::new(sx + src.min.x, src.min.y, sx + src.max.x, src.max.y)),
+            ox + src.min.x * k,
+            oy + src.min.y * k,
+            src.width() * k,
+            src.height() * k,
         );
     }
 
     /// Animated idle frame of a unit anchored at its foot `(x, y)` with scale `k` (menu level cards).
     pub fn unit_frame(&mut self, c: KingdomColor, k: UnitKind, frame: usize, x: f32, y: f32, scale: f32) {
         let path = unit_idle_sheet(c, k);
-        let Some(e) = self.ga.entry(&path) else {
+        let Some((fw, fh, ax, ay, n)) = self.sheet_info(&path) else {
             return;
         };
-        let (fw, fh) = (e.fw as f32, e.fh as f32);
-        let n = e.frames.max(1) as usize;
         let i = if matches!(k, UnitKind::Ram | UnitKind::Catapult) {
             0
         } else {
             frame % n
         };
-        let ax = e.ax.unwrap_or(fw / 2.0);
-        let ay = e.ay.unwrap_or(fh);
-        let sx = i as f32 * fw;
-        self.draw(
+        self.sheet_part(
             &path,
-            Some(Rect::new(sx, 0.0, sx + fw, fh)),
+            i,
+            Rect::new(0.0, 0.0, fw, fh),
             (x - ax * scale).round(),
             (y - ay * scale).round(),
-            (fw * scale).round(),
-            (fh * scale).round(),
+            scale,
         );
     }
 

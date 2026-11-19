@@ -64,7 +64,7 @@ impl Gen {
     }
 
     /// Coarse continent (02 §5.4 redesigned, ref. §11.1/§11.11): a union of rectangles in 4-cell blocks — a core
-    /// plus lobes and thin peninsulas grown outward from the coast until 58-68 % of the map is land — minus bays cut
+    /// plus lobes and thin peninsulas grown outward from the coast until 64-74 % of the coarse map is land (≈ 35-40 k mainland cells, as the JS island) — minus bays cut
     /// into the outline and inner seas; boundary blocks are then toggled at random (notches and bumps of 4 cells).
     fn coarse_continent(&mut self) -> (Vec<u8>, i32, i32) {
         let cw = W / COARSE;
@@ -104,9 +104,9 @@ impl Gen {
             }
             out
         };
-        let target = 0.58 + self.rnd() * 0.10;
+        let target = 0.64 + self.rnd() * 0.10;
         let total = (cw * ch) as f64;
-        for _ in 0..80 {
+        for _ in 0..240 {
             let frac = cm.iter().filter(|v| **v != 0).count() as f64 / total;
             if frac >= target {
                 break;

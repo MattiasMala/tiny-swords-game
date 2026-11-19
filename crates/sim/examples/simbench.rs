@@ -19,6 +19,7 @@ struct Args {
     seed: u32,
     quiet: bool,
     profile: bool,
+    trace: bool,
 }
 
 fn parse() -> Args {
@@ -28,6 +29,7 @@ fn parse() -> Args {
         seed: 1,
         quiet: false,
         profile: false,
+        trace: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -36,6 +38,7 @@ fn parse() -> Args {
             "--seed" => a.seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.seed),
             "--quiet" => a.quiet = true,
             "--profile" => a.profile = true,
+            "--trace" => a.trace = true,
             "--level" => {
                 a.levels = match it.next().as_deref() {
                     Some("easy") => vec![AiLevel::Easy],
@@ -125,6 +128,52 @@ fn print_minute(w: &World, minute: u32) {
     }
 }
 
+/// `--trace`: running waves in detail (target castle, members with position / order / target).
+fn print_waves(w: &mut World) {
+    for fi in 0..w.factions.len() {
+        let Some(wv) = w.factions[fi].ai.wave.clone() else {
+            continue;
+        };
+        let tc = w.ai_castle(wv.target);
+        // walking distance (cells x10) from the first member to the target castle
+        if let (Some(b), Some(u)) = (
+            w.factions[wv.target as usize].castle,
+            wv.ids.first().and_then(|id| w.units.get(*id)).map(|u| u.pos),
+        ) {
+            let a = w.map.cell_of(u);
+            let fr = w.field_for(ts_sim::path::FieldTarget::Building(b), side_of(fi as FactionIdx), a);
+            println!("   field dist {} crossed {}", w.fields.dist(fr.id, a), fr.crossed);
+        }
+        let f = &w.factions[fi];
+        let wv = &wv;
+        println!(
+            "   {} wave → {} castle {:?} start {:.0} leg_t {:.0} phase {:?}",
+            f.name(),
+            wv.target,
+            tc.map(|p| (p.x as i32, p.y as i32)),
+            wv.start,
+            wv.leg_t,
+            wv.phase
+        );
+        for id in &wv.ids {
+            let Some(u) = w.units.get(*id) else {
+                println!("      {id:?} gone");
+                continue;
+            };
+            let o = match &u.order {
+                Order::Idle { .. } => "idle".to_string(),
+                Order::Move(m) => format!("move→({:.0},{:.0})", m.to.x, m.to.y),
+                Order::AMove(m) => format!("amove→({:.0},{:.0})", m.to.x, m.to.y),
+                o => format!("{o:?}").chars().take(40).collect(),
+            };
+            println!(
+                "      {:?} {:?} at ({:.0},{:.0}) hp {:.0} {} target {:?}",
+                id, u.kind, u.pos.x, u.pos.y, u.hp, o, u.target
+            );
+        }
+    }
+}
+
 fn run(level: AiLevel, a: &Args) {
     let setup = MatchSetup {
         players: Vec::new(),
@@ -175,6 +224,9 @@ fn run(level: AiLevel, a: &Args) {
         }
         if !a.quiet {
             print_minute(&w, m);
+            if a.trace {
+                print_waves(&mut w);
+            }
             println!(
                 "   ({:.0} ticks/s this minute, waves so far {waves})",
                 ticks_per_min as f64 / tm.elapsed().as_secs_f64()

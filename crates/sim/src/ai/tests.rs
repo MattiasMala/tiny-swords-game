@@ -117,6 +117,8 @@ fn takeover_reset_keeps_state_and_fast_forwards() {
         phase: WavePhase::March,
         leg_t: 0.0,
         t0: 0.0,
+        best_d: super::AI_FAR,
+        best_t: 0.0,
     });
     w.factions[1].ai.due_t = Some(1.0);
     w.factions[1].ai.wave_t = -5.0;
@@ -137,7 +139,7 @@ fn find_spot_is_placeable_with_corridor() {
     let mut w = demo(AiLevel::Normal);
     let (bx, by) = w.factions[0].base;
     for kind in [BuildingKind::House, BuildingKind::Barracks, BuildingKind::Farm] {
-        let (cx, cy) = w.ai_find_spot(kind, bx, by + 1, 4, 18).expect("spot near the castle");
+        let (cx, cy) = w.ai_find_spot(0, kind, bx, by + 1, 4, 18).expect("spot near the castle");
         assert!(w.map.can_place(kind, cx, cy, &[]));
         let d = kind.def();
         for y in cy - 1..=cy + d.h {
@@ -193,6 +195,8 @@ fn spare_keeps_a_garrison_and_sends_melee_first() {
         phase: WavePhase::March,
         leg_t: -99.0,
         t0: 0.0,
+        best_d: super::AI_FAR,
+        best_t: 0.0,
     });
     let s2 = w.ai_spare(0, &intel);
     assert!(!s2.squad.contains(&s.squad[0]));
@@ -300,4 +304,26 @@ fn ai_tick_is_noop_for_humans_and_safe_for_dead() {
     for f in 2..5 {
         w.ai_tick(f);
     }
+}
+
+/// Reviewer fix: wave legs follow the walking path (never a point the wave cannot reach).
+#[test]
+fn path_leg_walks_toward_the_target_castle() {
+    let mut w = demo(AiLevel::Normal);
+    let from = near_castle(&w, 0, 0.0, 130.0);
+    let b = w.factions[1].castle.unwrap();
+    let tc = castle(&w, 1);
+    let side = side_of(0);
+    let a = w.map.cell_of(from);
+    let fr = w.field_for(crate::path::FieldTarget::Building(b), side, a);
+    let d0 = w.fields.dist(fr.id, a);
+    assert!(d0 < FIELD_INF, "castles are connected");
+    let p = w.ai_path_leg(0, from, b, 700.0).expect("reachable");
+    let fr = w.field_for(crate::path::FieldTarget::Building(b), side, a);
+    let d1 = w.fields.dist(fr.id, w.map.cell_of(p));
+    assert!(d1 < d0, "leg is closer by walking distance: {d1} vs {d0}");
+    // about 700 px of path (10-11 cells; terrain costs may add a little)
+    assert!(d0 - d1 >= 90 && d0 - d1 <= 140, "{d0} -> {d1}");
+    assert!(w.map.passable(w.map.cell_of(p), side));
+    assert!(p.dist(tc) < from.dist(tc) + 700.0);
 }

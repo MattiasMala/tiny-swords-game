@@ -27,6 +27,31 @@
   <div class="bar"><div class="fill" id="fill"></div></div>
   <div id="msg">Caricamento del gioco…</div>
 </div>
+<script>
+  // Browser autoplay policy: Bevy's audio backend (cpal/WebAudio) creates its AudioContext at startup, before any
+  // user gesture, so it starts "suspended" and nothing would ever resume it. Track every context created by the
+  // page and resume it on each key / pointer press (the Rust side also waits for the first gesture, 07 §10.1).
+  (function () {
+    const made = [];
+    const track = (C) => C && new Proxy(C, {
+      construct(target, args) {
+        const ctx = new target(...args);
+        made.push(ctx);
+        return ctx;
+      },
+    });
+    if (window.AudioContext) window.AudioContext = track(window.AudioContext);
+    if (window.webkitAudioContext) window.webkitAudioContext = track(window.webkitAudioContext);
+    const resume = () => {
+      for (const ctx of made) {
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      }
+    };
+    for (const ev of ['pointerdown', 'mousedown', 'keydown', 'touchend']) {
+      document.addEventListener(ev, resume, { capture: true });
+    }
+  })();
+</script>
 <script type="module">
   const canvas = document.getElementById('game');
   const boot = document.getElementById('boot');

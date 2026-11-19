@@ -18,7 +18,7 @@ use ts_sim::defs::{BUILDING_SIGHT_DY, BuildingKind, KingdomColor, NodeKind, POIN
 use ts_sim::snapshot_types::UF_INSIDE;
 
 /// Texture pixels per cell of the objects layer.
-const OBJ_PX: usize = 3;
+const OBJ_PX: usize = 2;
 /// Texture pixels per cell of the terrain layer.
 const TER_PX: usize = 2;
 
@@ -317,7 +317,7 @@ pub fn update_layers(
         }
     }
     // fog: visible now from own units / buildings / points; explored from the mirror
-    let all_visible = super::fog_off(&mirror);
+    let all_visible = super::fog_off(&mirror) || st.result.is_some();
     let cache = &mut *cache;
     let vis = &mut cache.vis;
     let alphas = &mut cache.alpha;
@@ -425,7 +425,7 @@ pub fn draw_map(
         let Some(pos) = point_pos(mirror, p.id.0 as usize) else {
             continue;
         };
-        if !super::knows(mirror, pos.x, pos.y - TILE) {
+        if st.result.is_none() && !super::knows(mirror, pos.x, pos.y - TILE) {
             continue;
         }
         let c = Vec2::new(x + pos.x * k.x, y + (pos.y - TILE) * k.y);
@@ -449,10 +449,9 @@ pub fn draw_map(
             )
         })
         .collect();
-    if !big {
-        for i in 0..4 {
-            u.p.line(pts[i], pts[(i + 1) % 4], 1.5 * s, cw);
-        }
+    // (drawn on the Invia big map too, as `drawMap` does)
+    for i in 0..4 {
+        u.p.line(pts[i], pts[(i + 1) % 4], 1.5 * s, cw);
     }
     // attack pings
     for &(px, py, t) in &st.pings {

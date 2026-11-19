@@ -1,6 +1,6 @@
 //! Help, pause / network menu, game over, reconnecting overlay (spec 06 §11, 08 addenda N1/N3).
 
-use super::kit::{ACCENT, INK, MUTED, PARCH, Ui, WHITE, panel};
+use super::kit::{ACCENT, INK, MUTED, PARCH, Ui, panel};
 use super::paint::Align;
 use super::{Env, MatchResult, UiState, View};
 use crate::link::LinkRequest;
@@ -213,7 +213,7 @@ pub fn draw_game_over(u: &mut Ui, st: &mut UiState, env: &mut Env, v: &View) {
 
 /// Reconnecting overlay (08 addenda N1/N3): network game whose socket is down.
 pub fn draw_reconnecting(u: &mut Ui, env: &Env) {
-    if !env.lobby.remote || env.lobby.connected {
+    if !env.lobby.remote || !env.lobby.reconnecting {
         return;
     }
     let (w, h) = (u.w(), u.h());
@@ -222,5 +222,4 @@ pub fn draw_reconnecting(u: &mut Ui, env: &Env) {
     let tw = u.tw(ts_sim::proto::RECONNECTING, 22.0 * s);
     u.panel(&panel::PAPER, w / 2.0 - tw / 2.0 - 40.0 * s, h / 2.0 - 34.0 * s, tw + 80.0 * s, 68.0 * s, 0.6 * s);
     u.plain(ts_sim::proto::RECONNECTING, w / 2.0, h / 2.0, 22.0 * s, INK, Align::Center);
-    let _ = WHITE;
 }

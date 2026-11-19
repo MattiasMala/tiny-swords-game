@@ -55,8 +55,13 @@ pub fn stamp_disc(g: &mut BitGrid, map_w: i32, map_h: i32, p: V2, r: i32) {
     if r < 0 || !p.is_finite() || g.words.is_empty() {
         return;
     }
+    // radii are sight values (≤ ~20 cells); a far-off-map centre touches nothing and must not overflow below
+    let r = r.min(4096);
     let cx = (p.x / TILE).floor() as i32;
     let cy = (p.y / TILE).floor() as i32;
+    if cx < -r || cy < -r || cx > map_w.saturating_add(r) || cy > map_h.saturating_add(r) {
+        return;
+    }
     let rr = r * r + r;
     let j0 = (cy - r).max(0);
     let j1 = (cy + r).min(map_h - 1);

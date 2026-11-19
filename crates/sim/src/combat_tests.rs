@@ -727,3 +727,185 @@ fn equal_cost_counters_hold() {
     let (war, lan) = duel(UnitKind::Warrior, 7, UnitKind::Lancer, 7);
     assert!(war > 0 && lan == 0, "warriors {war} vs lancers {lan}");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review additions (adversarial pass)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// `moveUnit` faces by the offset BEFORE the step (JS `dx = tx - u.x`): a unit stepping 4.9 of 5 px to the west
+/// must face west even though only 0.1 px are left after the step. A NaN goal is ignored.
+#[test]
+fn move_unit_faces_from_offset_before_the_step() {
+    let mut w = test_world();
+    let u = spawn(&mut w, 0, UnitKind::Warrior, A);
+    assert!(!w.units.get(u).unwrap().flip);
+    w.move_unit(u, A + v2(-5.0, 0.0));
+    let un = w.units.get(u).unwrap();
+    assert!(un.flip, "faces west");
+    assert!((un.pos.x - (A.x - 4.9)).abs() < 1e-3);
+    let before = un.pos;
+    w.move_unit(u, v2(f32::NAN, 0.0));
+    w.move_unit(u, v2(f32::INFINITY, 0.0));
+    let p = w.units.get(u).unwrap().pos;
+    assert_eq!(p, before);
+}
+
+/// Arrows hit the first ENEMY building whose box (`x0<x<x1`, `y0-70<y<y1`) they enter, fly through own ones.
+#[test]
+fn arrows_hit_enemy_buildings_through_own_ones() {
+    let mut w = test_world();
+    let own = w.add_building(0, BuildingKind::House, 96, 90, true);
+    let enemy = w.add_building(1, BuildingKind::House, 100, 90, true);
+    let r = spawn(&mut w, 0, UnitKind::Archer, A);
+    let shooter = Shooter::Unit {
+        id: r,
+        kind: UnitKind::Archer,
+    };
+    let hp0 = w.buildings.get(enemy).unwrap().hp;
+    let own0 = w.buildings.get(own).unwrap().hp;
+    let fire = |w: &mut World, y: f32| {
+        w.fire_arrow(0, shooter, v2(94.0 * 64.0, y), v2(103.0 * 64.0, y), 12.0);
+        for _ in 0..40 {
+            w.update_projectiles();
+        }
+        assert!(w.projectiles.is_empty());
+    };
+    // through the middle of both houses: own untouched, enemy takes 12 × 0.5 (vsBuilding) × 0.4
+    fire(&mut w, 90.0 * 64.0 + 30.0);
+    let hp1 = w.buildings.get(enemy).unwrap().hp;
+    assert!((hp0 - hp1 - 2.4).abs() < 1e-3, "{hp0} -> {hp1}");
+    assert_eq!(w.buildings.get(own).unwrap().hp, own0);
+    // 50 px above the roof still hits (box starts 70 px above y0), 80 px above flies over
+    fire(&mut w, 90.0 * 64.0 - 50.0);
+    let hp2 = w.buildings.get(enemy).unwrap().hp;
+    assert!((hp1 - hp2 - 2.4).abs() < 1e-3);
+    fire(&mut w, 90.0 * 64.0 - 80.0);
+    assert_eq!(w.buildings.get(enemy).unwrap().hp, hp2);
+}
+
+/// Equal numbers (10 v 10, archers being much cheaper): warriors must not walk over archers for free — the
+/// archers' 1.7 bonus and kiting have to cost the warriors a good part of their group.
+#[test]
+fn ten_warriors_vs_ten_archers() {
+    let (war, arch) = duel(UnitKind::Warrior, 10, UnitKind::Archer, 10);
+    assert!(war == 0 || arch == 0, "the fight ends: warriors {war} archers {arch}");
+    assert!(war <= 6, "archers bleed the warriors: {war} left");
+}
+
+/// The same setup always gives the same battle (all randomness from `World.rng`).
+#[test]
+fn mixed_battle_is_deterministic() {
+    let run = || {
+        let mut w = test_world();
+        let kinds = [
+            UnitKind::Warrior,
+            UnitKind::Lancer,
+            UnitKind::Archer,
+            UnitKind::Knight,
+            UnitKind::Monk,
+            UnitKind::Catapult,
+        ];
+        for f in 0..2u8 {
+            let ids: Vec<UnitId> = (0..24)
+                .map(|i| {
+                    let p = A + v2((i % 6) as f32 * 40.0, (i / 6) as f32 * 40.0 + f as f32 * 700.0);
+                    w.spawn_unit(f, kinds[i % kinds.len()], p)
+                })
+                .collect();
+            w.grid.rebuild(&w.units);
+            w.order_units(f, &ids, OrderKind::AMove, A.x + 100.0, A.y + 350.0, None);
+        }
+        unit_ticks(&mut w, 20 * 60, |_| false);
+        let mut s: Vec<(u32, i32, i32, i32)> = w
+            .units
+            .iter()
+            .map(|(id, u)| (id.0.index, u.pos.x as i32, u.pos.y as i32, u.hp as i32))
+            .collect();
+        s.sort_unstable();
+        (s, w.factions[0].kills, w.factions[1].kills)
+    };
+    let a = run();
+    assert!(a.1 + a.2 > 0, "somebody died");
+    assert_eq!(a, run());
+}
+
+/// Human assault chain (§8.7): after the first kill the soldiers go on by themselves to the next enemy within
+/// 900 px; when nothing is left after an automatic step they stop and guard.
+#[test]
+fn human_raid_chain_reaches_the_next_enemy() {
+    let mut w = test_world();
+    w.factions[0].human = true;
+    let ks: Vec<UnitId> = (0..2)
+        .map(|i| spawn(&mut w, 0, UnitKind::Knight, A + v2(0.0, i as f32 * 40.0)))
+        .collect();
+    let c1 = spawn(&mut w, 1, UnitKind::Catapult, A + v2(400.0, 0.0));
+    let c2 = spawn(&mut w, 1, UnitKind::Catapult, A + v2(1050.0, 0.0));
+    for c in [c1, c2] {
+        w.units.get_mut(c).unwrap().cd = 1e9; // never shoots
+    }
+    w.order_units(0, &ks, OrderKind::AMove, A.x + 400.0, A.y, None);
+    unit_ticks(&mut w, 20 * 60, |w| !w.unit_alive(c1) && !w.unit_alive(c2));
+    assert!(!w.unit_alive(c1) && !w.unit_alive(c2), "both catapults destroyed");
+    unit_ticks(&mut w, 20 * 20, |w| ks.iter().all(|k| w.units.get(*k).unwrap().order.is_idle()));
+    for k in &ks {
+        assert!(w.units.get(*k).unwrap().order.is_idle(), "chain ends idle");
+    }
+}
+
+/// Addenda U1: an idle soldier of a human kingdom guarding far from home answers the alarm and gets a new post
+/// next to the castle (one RNG pair), then goes back there via `hold_post` once the alarm is over.
+#[test]
+fn alarm_moves_far_post_next_to_the_castle() {
+    let mut w = test_world();
+    w.factions[1].human = true;
+    let castle = w.factions[1].castle.unwrap();
+    let (cpos, cy1) = {
+        let c = w.buildings.get(castle).unwrap();
+        (c.pos, c.rect.y1)
+    };
+    let s = spawn(&mut w, 1, UnitKind::Warrior, A);
+    assert!(A.dist(cpos) > HOME_RADIUS);
+    w.time = 100.0;
+    w.factions[1].alarm = Some(Alarm {
+        pos: A + v2(600.0, 0.0),
+        t: 99.0,
+    });
+    w.units.get_mut(s).unwrap().think_t = 1.0; // no enemy anyway
+    w.update_soldier(s);
+    let post = w.post_of(s).expect("still idle");
+    assert!((post.x - cpos.x).abs() <= 140.0 + 64.0, "{post:?} vs {cpos:?}");
+    assert!(post.y >= cy1 && post.y <= cy1 + 150.0 + 64.0, "{post:?}");
+    // it runs to the alarm spot (stops 120 px short)
+    let p0 = w.units.get(s).unwrap().pos;
+    assert!(p0.x > A.x, "runs toward the alarm");
+    // a second call does not re-roll the post (now near home)
+    w.update_soldier(s);
+    assert_eq!(w.post_of(s), Some(post));
+}
+
+/// `open_corridor` (long straight shortcut of `approach`): needs one free, level, stair-less cell around every
+/// crossed cell; any building within one cell of the line sends the unit back to the distance field.
+#[test]
+fn open_corridor_requires_a_clear_band() {
+    let mut w = test_world();
+    let a = v2(90.5 * 64.0, 60.5 * 64.0);
+    let b = v2(110.5 * 64.0, 60.5 * 64.0);
+    assert!(w.open_corridor(a, b, 1));
+    // a house one cell off the line (rows 62..62 vs line row 60 → 2 rows away): still clear
+    let h = w.add_building(1, BuildingKind::House, 100, 62, true);
+    assert!(w.open_corridor(a, b, 1));
+    w.block_building(h, false);
+    // one row off the line: blocked band
+    w.add_building(0, BuildingKind::House, 100, 61, true);
+    assert!(!w.open_corridor(a, b, 1));
+    // a raised cell on the way: different level → field
+    let mut w = test_world();
+    let c = 60 * W + 105;
+    w.map.level[c as usize] = 1;
+    assert!(!w.open_corridor(a, b, 1));
+    // the unit walks straight through open ground (no field computed)
+    let mut w = test_world();
+    let u = spawn(&mut w, 0, UnitKind::Knight, a);
+    assert!(w.approach(u, b));
+    assert!(w.fields.is_empty(), "no distance field for an open straight run");
+}

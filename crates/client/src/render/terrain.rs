@@ -2,8 +2,10 @@
 // per-vertex AO, Tiny Swords tileset textures), spec 02-world.md §2 (map layers), 09-asset-inventory.md §3, §11
 // (tiers, cliffs on south edges, stairs, foam, surfaces), 05 §12 (fog of war on the ground).
 //
-// * `terrain_atlas`: the texture array cut from `Tilemap_color1..5` at load time (148 layers, mip-mapped).
-// * `terrain_mesh`: heights (levels, beaches, ramps), exact `ground_height`, chunk mesher (faces, AO, jitter).
+// * `terrain_atlas`: the texture array cut from `Tilemap_color1..5` at load time (228 layers + 1 spare: WebGL2 takes a
+//   count multiple of 6 for a cube array), ≤ the 256 WebGL2 guarantees, mip-mapped.
+// * `terrain_mesh`: heights (levels, beaches, cliff columns, stair slopes), exact `ground_height`, chunk mesher
+//   (visible faces, AO, jitter, grass lips).
 // * `terrain_fog`: `FogTexture` (contract) — per-cell fog of war, applied here, on the water and by C2 on sprites.
 // * this file: the `TerrainMaterial` (StandardMaterial + array texture + fog, WESL shader
 //   `shaders/terrain.wesl`, embedded for wasm) and the chunk entities, rebuilt when `Mirror::generation` changes.
@@ -108,26 +110,32 @@ fn build_atlas(
     if tt.array.is_some() || tt.sources.len() != 5 {
         return;
     }
-    let mut owned: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(5);
-    for h in &tt.sources {
-        let Some(img) = images.get(h) else { return };
-        let Some(data) = img.data.as_ref() else {
-            warn_once!("tileset senza dati CPU: terreno non texturizzato");
+    // all five sheets must be loaded with their CPU pixels (RGBA8); cut the layers from borrowed data (no copies)
+    let layers = {
+        let mut sheets: Vec<atlas::Sheet> = Vec::with_capacity(5);
+        for h in &tt.sources {
+            let Some(img) = images.get(h) else { return };
+            let Some(data) = img.data.as_deref() else {
+                warn_once!("tileset senza dati CPU: terreno non texturizzato");
+                return;
+            };
+            let (w, hh) = (img.width() as usize, img.height() as usize);
+            // only RGBA8 sheets are supported (PNG default)
+            if data.len() < w * hh * 4 {
+                warn_once!("tileset in formato inatteso: terreno non texturizzato");
+                return;
+            }
+            sheets.push(atlas::Sheet {
+                data,
+                width: w,
+                height: hh,
+            });
+        }
+        let Ok(sheets) = <[atlas::Sheet; 5]>::try_from(sheets) else {
             return;
         };
-        let (w, hh) = (img.width() as usize, img.height() as usize);
-        // only RGBA8 sheets are supported (PNG default)
-        if data.len() < w * hh * 4 {
-            return;
-        }
-        owned.push((data.clone(), w, hh));
-    }
-    let sheets: [atlas::Sheet; 5] = std::array::from_fn(|i| atlas::Sheet {
-        data: &owned[i].0,
-        width: owned[i].1,
-        height: owned[i].2,
-    });
-    let layers = atlas::build_layers(&sheets);
+        atlas::build_layers(&sheets)
+    };
     let array = images.add(atlas::array_image(&layers));
     let mat = mats.add(ExtendedMaterial {
         base: StandardMaterial {
@@ -147,6 +155,8 @@ fn build_atlas(
     info!("terreno: atlante di {} strati pronto", layers.len());
     tt.array = Some(array);
     tt.material = Some(mat);
+    // the sheets were only needed to cut the layers: release their CPU and GPU copies
+    tt.sources.clear();
 }
 
 /// Mesh of one chunk.
@@ -176,16 +186,21 @@ fn rebuild_terrain(
     tt: Res<TerrainTextures>,
     old: Query<Entity, With<TerrainMesh>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut built: Local<Option<u32>>,
+    mut built: Local<Option<(u32, usize)>>,
 ) {
-    if *built == Some(mirror.generation) {
+    // rebuild for a new generation, or when the chunks were despawned (left `InGame` and came back to the same
+    // match without a new `Init`)
+    if let Some((g, n)) = *built
+        && g == mirror.generation
+        && (n == 0 || !old.is_empty())
+    {
         return;
     }
     let Some(map) = mirror.map() else { return };
     let Some(mat) = tt.material.clone() else {
         return;
     };
-    *built = Some(mirror.generation);
+    let mut spawned = 0;
     for e in &old {
         commands.entity(e).despawn();
     }
@@ -208,8 +223,10 @@ fn rebuild_terrain(
                 MeshMaterial3d(mat.clone()),
                 Transform::IDENTITY,
             ));
+            spawned += 1;
         }
     }
+    *built = Some((mirror.generation, spawned));
 }
 
 /// Keeps the material's fog switch and map size in sync (fog off for spectators / end of match is already in the

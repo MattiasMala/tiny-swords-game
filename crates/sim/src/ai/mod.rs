@@ -50,7 +50,15 @@ pub struct AiWave {
     pub leg_t: f32,
     /// launch time (written, never read in JS)
     pub t0: f32,
+    /// closest straight-line distance of the fighters' centroid to the target castle while marching (stall check,
+    /// reviewer addition; `AI_FAR` before the first measurement)
+    pub best_d: f32,
+    /// game time `best_d` last improved
+    pub best_t: f32,
 }
+
+/// Initial `AiWave::best_d` (finite so that every serializer accepts it).
+pub const AI_FAR: f32 = 1.0e9;
 
 /// `f.ai` (04b §3). Timers are in game seconds; `wave_t` is decremented by `level.think` inside think.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

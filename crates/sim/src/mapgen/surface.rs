@@ -7,7 +7,6 @@
 //! of the raised block), stairs the surface of their upper tier.
 
 use super::grid::{Mask, cheb_dist};
-use super::land::COARSE;
 use super::roads::ROAD_CORE;
 use super::scenery::{PAINT_DIRT, PAINT_DRY, PAINT_SAND};
 use super::{Gen, H, W, idx};
@@ -24,19 +23,20 @@ fn tier(level: u8) -> Surface {
 impl Gen {
     pub fn surfaces(&mut self) {
         let n = self.map.len();
-        // ---- dry meadows: coarse blocky noise patches on the open lowland ----
-        let cw = W / COARSE;
-        let ch = H / COARSE;
-        let mut coarse = vec![0u8; (cw * ch) as usize];
-        for cy in 0..ch {
-            for cx in 0..cw {
-                let v = self.noise.fbm(cx as f64 * 0.16 + 71.0, cy as f64 * 0.16 + 37.0);
-                coarse[(cy * cw + cx) as usize] = (v > 0.71) as u8;
+        // ---- dry meadows: soft-edged noise patches on the open lowland (low-frequency fbm with a finer wobble),
+        //      cleaned so no one-cell bits remain ----
+        let mut dry = Mask::new(W, H);
+        for y in 0..H {
+            for x in 0..W {
+                let v = self.noise.fbm(x as f64 * 0.045 + 71.0, y as f64 * 0.045 + 37.0)
+                    + (self.noise.at(x as f64 * 0.21 + 5.0, y as f64 * 0.21 + 9.0) - 0.5) * 0.08;
+                dry.v[(y * W + x) as usize] = (v > 0.69) as u8;
             }
         }
-        let dry = self.upscale(&coarse, cw, ch, 0.5);
+        let dry = dry.open(3).close(3);
 
-        // ---- pine-wood floor: dense pines (≥ 4 within the 5x5 window), dilated, cleaned ----
+        // ---- pine-wood floor: dense pines (≥ 3 within the 3x3 window), one cell beyond the crowns, cleaned:
+        //      follows the irregular outline of the wood ----
         let mut pines = vec![0u8; n];
         for t in &self.trees {
             if t.variant < 2 {
@@ -48,7 +48,7 @@ impl Gen {
         for y in 0..H {
             for x in 0..W {
                 let c = (y * W + x) as usize;
-                if sat.sum(x - 2, y - 2, x + 2, y + 2) >= 4 && self.map.land[c] == 1 && self.map.level[c] == 0 {
+                if sat.sum(x - 1, y - 1, x + 1, y + 1) >= 3 && self.map.land[c] == 1 && self.map.level[c] == 0 {
                     forest.v[c] = 1;
                 }
             }
@@ -104,6 +104,34 @@ impl Gen {
                     .count();
                 if around == 0 {
                     self.map.surface[c] = tier(self.map.level[c]);
+                }
+            }
+        }
+
+        // road cells touching another only by a corner (a track end clipped by the cleanup above, a widened cell):
+        // pave one corner so every track reads as a continuous band
+        for y in 0..H - 1 {
+            for x in 1..W - 1 {
+                let c = idx(x, y) as usize;
+                if self.map.surface[c] != Surface::Path {
+                    continue;
+                }
+                for dx in [1, -1] {
+                    let d = idx(x + dx, y + 1) as usize;
+                    let (a, b) = (idx(x + dx, y) as usize, idx(x, y + 1) as usize);
+                    let m = &self.map;
+                    if m.surface[d] != Surface::Path || m.surface[a] == Surface::Path || m.surface[b] == Surface::Path {
+                        continue;
+                    }
+                    let lvl = m.level[c];
+                    let pave = |k: usize| {
+                        m.land[k] == 1 && m.cliff[k] == 0 && m.stair[k] == 0 && m.level[k] == lvl
+                    };
+                    if pave(a) {
+                        self.map.surface[a] = Surface::Path;
+                    } else if pave(b) {
+                        self.map.surface[b] = Surface::Path;
+                    }
                 }
             }
         }

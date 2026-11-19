@@ -342,7 +342,9 @@ impl World {
         if d.from != bl.kind || !bl.done {
             return Some(cmd::NON_DISPONIBILE.to_string());
         }
-        let fac = &self.factions[f as usize];
+        let Some(fac) = self.factions.get(f as usize) else {
+            return Some(cmd::NON_DISPONIBILE.to_string());
+        };
         age_lock(fac.age, d.age).or_else(|| {
             if bl.queue.len() >= QUEUE_MAX {
                 Some(cmd::CODA_PIENA.to_string())
@@ -357,7 +359,9 @@ impl World {
     /// `techLock(f, def)`: age lock, then the prerequisite tech (`Richiede: label`).
     pub fn tech_lock(&self, f: FactionIdx, t: TechId) -> Option<String> {
         let d = t.def();
-        let fac = &self.factions[f as usize];
+        let Some(fac) = self.factions.get(f as usize) else {
+            return Some(cmd::NON_DISPONIBILE.to_string());
+        };
         age_lock(fac.age, d.age).or_else(|| {
             d.req
                 .filter(|r| !fac.techs.has(*r))
@@ -375,7 +379,9 @@ impl World {
         if d.at != bl.kind || !bl.done {
             return Some(cmd::NON_DISPONIBILE.to_string());
         }
-        let fac = &self.factions[f as usize];
+        let Some(fac) = self.factions.get(f as usize) else {
+            return Some(cmd::NON_DISPONIBILE.to_string());
+        };
         if fac.techs.has(t) {
             return Some(cmd::GIA_RICERCATA.to_string());
         }
@@ -406,7 +412,9 @@ impl World {
             return Some(cmd::QUI_NON_SI_PUO_COSTRUIRE.to_string());
         }
         let d = kind.def();
-        let fac = &self.factions[f as usize];
+        let Some(fac) = self.factions.get(f as usize) else {
+            return Some(cmd::QUI_NON_SI_PUO_COSTRUIRE.to_string());
+        };
         if let Some(l) = age_lock(fac.age, d.age) {
             return Some(l);
         }
@@ -420,7 +428,11 @@ impl World {
             (cx as f32 + d.w as f32 / 2.0) * TILE,
             (cy as f32 + d.h as f32 / 2.0) * TILE,
         );
-        if !self.map.can_place(kind, cx, cy, &[]) || !self.explored(f, centre) {
+        // `inside` first: an absurd cell (e.g. i32::MAX) must not reach the footprint arithmetic
+        if !self.map.inside(cx, cy)
+            || !self.map.can_place(kind, cx, cy, &[])
+            || !self.explored(f, centre)
+        {
             return Some(cmd::QUI_NON_SI_PUO_COSTRUIRE.to_string());
         }
         None
@@ -435,10 +447,13 @@ impl World {
         if bl.kind == BuildingKind::Castle {
             return Some(cmd::CASTELLO_NON_SI_SPOSTA.to_string());
         }
+        if (f as usize) >= self.factions.len() {
+            return Some(cmd::QUI_NON_PUO_STARE.to_string());
+        }
         if let Some(z) = self.zone_block(f, bl.kind, cx, cy) {
             return Some(z);
         }
-        if self.map.can_place(bl.kind, cx, cy, &bl.cells()) {
+        if self.map.inside(cx, cy) && self.map.can_place(bl.kind, cx, cy, &bl.cells()) {
             None
         } else {
             Some(cmd::QUI_NON_PUO_STARE.to_string())
@@ -704,6 +719,46 @@ mod tests {
             w.place_block(f, BuildingKind::House, hx, hy),
             Some("Qui non si può costruire".into())
         );
+        // AI-driven (takeover): no fog for its placements
+        w.factions[f as usize].human = false;
+        assert_eq!(w.place_block(f, BuildingKind::House, hx, hy), None);
+    }
+
+    #[test]
+    fn absurd_input_never_panics() {
+        let mut w = base_world();
+        let f = human(&w);
+        w.step(&[]);
+        w.factions[f as usize].res = Stock([5000.0; 4]);
+        let c = castle_of(&w, f);
+        let site = {
+            let (hx, hy) = spot(&w, f, BuildingKind::House);
+            let cmd = Command::Place { kind: BuildingKind::House, cx: hx, cy: hy, builders: vec![] };
+            w.exec_command(f, &cmd).unwrap();
+            w.buildings
+                .iter()
+                .find(|(_, b)| b.faction == f && b.kind == BuildingKind::House)
+                .map(|(id, _)| id)
+                .unwrap()
+        };
+        for (cx, cy) in [(i32::MAX, i32::MAX), (i32::MIN, i32::MIN), (i32::MAX, 0), (0, i32::MIN)] {
+            let p = Command::Place { kind: BuildingKind::Wall, cx, cy, builders: vec![] };
+            assert!(w.exec_command(f, &p).is_err());
+            let m = Command::Move { building: site, cx, cy };
+            assert!(w.exec_command(f, &m).is_err());
+        }
+        let r = Command::Rally { building: c, x: f32::MAX, y: -f32::MAX, target: None };
+        assert_eq!(w.exec_command(f, &r), Ok(()));
+        let cancel = Command::Cancel { building: c, index: 255, expected: QueueWhat::Unit(UnitKind::Pawn) };
+        assert_eq!(w.exec_command(f, &cancel), Ok(()));
+        assert!(w.exec_command(f, &Command::Jobs { res: Res::Wood, n: u16::MAX }).is_err());
+        // unknown faction index: ignored
+        assert_eq!(w.exec_command(200, &Command::DebugGift { res: None }), Ok(()));
+        assert!(!w.can_afford(200, &BuildingKind::House.def().cost));
+        assert_eq!(w.train_block(200, c, UnitKind::Pawn), Some("Non disponibile".into()));
+        // far-off rally point / units: fog stamping ignores off-map centres
+        crate::fog::stamp_disc(&mut w.factions[f as usize].fog.explored, w.map.w, w.map.h, v2(3.0e38, -3.0e38), 9);
+        w.step(&[]);
     }
 
     #[test]

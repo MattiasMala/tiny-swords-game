@@ -23,6 +23,8 @@ use ts_sim::defs::{BuildingKind, CAPTURE_TIME, KingdomColor, NodeKind, UnitKind}
 
 /// Overlays are pulled this far (world units) towards the camera.
 const PULL: f32 = 2.0;
+/// The placement ghost (footprint fill + sprite) is drawn over the buildings it overlaps, like the 2D `Ctl.drawWorld`.
+const GHOST_PULL: f32 = 3.0;
 
 /// `COLOR_CSS` as linear rgba (vertex colours are linear).
 pub fn css_linear(c: KingdomColor) -> [f32; 4] {
@@ -46,11 +48,28 @@ struct WorldLabelText;
 #[derive(Component)]
 struct WorldLabelIcon;
 
-/// Screen labels requested this frame (cleared in `SpriteSystems::Prepare`): (screen pos — left-centre, or centre
-/// when `centred` —, text, size px, colour, optional icon, centred).
+/// One screen label anchored to a world point. Projected in `PostUpdate` with the camera of the frame being rendered
+/// (the camera eases in `PostUpdate`, so a projection done in `Update` would trail the sprites by one frame).
+#[derive(Clone, Debug)]
+pub struct LabelReq {
+    /// world anchor
+    pub world: Vec3,
+    /// horizontal offset of the label's left edge (centre when `centred`) from the anchor, in sprite px
+    pub dx: f32,
+    pub text: String,
+    /// font size in sprite px (scaled by the on-screen size of a sprite px)
+    pub size: f32,
+    pub color: Color,
+    pub icon: Option<Handle<Image>>,
+    /// icon side in sprite px
+    pub icon_size: f32,
+    pub centred: bool,
+}
+
+/// Screen labels requested this frame (cleared in `SpriteSystems::Prepare`).
 #[derive(Resource, Default)]
 pub struct LabelRequests {
-    pub list: Vec<(Vec2, String, f32, Color, Option<Handle<Image>>, bool)>,
+    pub list: Vec<LabelReq>,
 }
 
 fn clear_labels(mut req: ResMut<LabelRequests>) {
@@ -67,8 +86,14 @@ impl Plugin for SpritesOverlayPlugin {
                 (
                     clear_labels.in_set(crate::render::sprites::SpriteSystems::Prepare),
                     draw_overlays.in_set(DrawStage::Late),
-                    place_labels.after(DrawStage::Late),
                 )
+                    .run_if(in_state(crate::AppState::InGame)),
+            )
+            .add_systems(
+                PostUpdate,
+                place_labels
+                    .after(bevy::transform::TransformSystems::Propagate)
+                    .before(bevy::ui::UiSystems::Prepare)
                     .run_if(in_state(crate::AppState::InGame)),
             )
             .add_systems(OnExit(crate::AppState::InGame), hide_labels);
@@ -206,13 +231,6 @@ fn draw_overlays(
         basis: &basis,
         atlas: &atlas,
     };
-    // screen px per sprite px at a world point (label sizes)
-    let px_scale = |w: Vec3| -> f32 {
-        match (basis.project(w), basis.project(w + basis.right * 100.0)) {
-            (Some((a, _)), Some((b, _))) => (b - a).length() / 100.0,
-            _ => 1.0,
-        }
-    };
 
     // ---- units: selection ellipse + HP bar ----
     for (id, u) in &mirror.view.units {
@@ -301,25 +319,24 @@ fn draw_overlays(
             } else {
                 (fp.x - 34.0, top - 22.0)
             };
-            let w = foot + basis.right * (bx - fp.x) + basis.up * (fp.y - by);
-            if let Some((s, _)) = basis.project(w) {
-                let k = px_scale(foot);
-                let avatar = {
-                    let ci = color_of(b.faction).index();
-                    let n = ci * 5 + 4 + 1;
-                    ga.image(&format!(
-                        "UI Elements/UI Elements/Human Avatars/Avatars_{n:02}.png"
-                    ))
-                };
-                labels.list.push((
-                    s - Vec2::new(17.0 * k, 0.0),
-                    format!("×{}", b.sheltered),
-                    17.0 * k,
-                    Color::srgb_u8(0xff, 0xf7, 0xc9),
-                    avatar,
-                    false,
-                ));
-            }
+            // avatar (34 px) with its top-left at (bx, by), label '×n' to its right, centred on the avatar row
+            let avatar = {
+                let ci = color_of(b.faction).index();
+                let n = ci * 5 + 4 + 1;
+                ga.image(&format!(
+                    "UI Elements/UI Elements/Human Avatars/Avatars_{n:02}.png"
+                ))
+            };
+            labels.list.push(LabelReq {
+                world: foot + basis.right * (bx - fp.x) + basis.up * (fp.y - (by + 17.0)),
+                dx: 0.0,
+                text: format!("×{}", b.sheltered),
+                size: 17.0,
+                color: Color::srgb_u8(0xff, 0xf7, 0xc9),
+                icon: avatar,
+                icon_size: 34.0,
+                centred: false,
+            });
         }
         if !b.done && wide {
             let prog = if d.work > 0.0 {
@@ -346,13 +363,16 @@ fn draw_overlays(
         if b.kind == BuildingKind::Castle {
             let c = color_of(b.faction);
             ov.ribbon(&sheets, c.index(), fp.x, top + 4.0, 190.0, 0.8);
-            let w = foot + basis.up * (fp.y - (top + 4.0 - 1.0));
-            if let Some((s, _)) = basis.project(w) {
-                let k = px_scale(foot);
-                labels
-                    .list
-                    .push((s, c.kingdom_name(), 15.0 * k, Color::WHITE, None, true));
-            }
+            labels.list.push(LabelReq {
+                world: foot + basis.up * (fp.y - (top + 4.0 - 1.0)),
+                dx: 0.0,
+                text: c.kingdom_name(),
+                size: 15.0,
+                color: Color::WHITE,
+                icon: None,
+                icon_size: 0.0,
+                centred: true,
+            });
         }
         if selected {
             let x0 = b.cx as f32 * TILE;
@@ -494,11 +514,13 @@ fn draw_overlays(
                     (cell.y + d.h) as f32,
                     h,
                     col,
+                    GHOST_PULL,
                 );
             }
             if sh != NONE {
                 p.sprite(Layer::Dynamic, Flavor::Translucent, sh, 0, foot, SpriteOpts {
                     color: [1.0, 1.0, 1.0, 0.65],
+                    pull: GHOST_PULL,
                     ..default()
                 });
             }
@@ -506,11 +528,15 @@ fn draw_overlays(
     }
 }
 
-/// Positions pooled UI labels (castle names, sheltered counts); spawns more when needed.
+/// Positions pooled UI labels (castle names, sheltered counts, floating "+N"); spawns more when needed. Runs in
+/// `PostUpdate` after transform propagation: the projection uses the camera transform of the frame being rendered.
+#[allow(clippy::too_many_arguments)]
 fn place_labels(
     mut commands: Commands,
     req: Res<LabelRequests>,
     ga: Res<GameAssets>,
+    basis: Res<Basis>,
+    cams: Query<(&Camera, &GlobalTransform), With<crate::render::camera::RtsCamera>>,
     mut q: Query<(&WorldLabel, &mut Node, &mut Visibility, &Children)>,
     mut texts: Query<
         (&mut Text, &mut TextFont, &mut TextColor, &mut TextShadow),
@@ -518,25 +544,50 @@ fn place_labels(
     >,
     mut icons: Query<(&mut ImageNode, &mut Node), (With<WorldLabelIcon>, Without<WorldLabel>)>,
 ) {
+    let view = cams.single().ok().and_then(|(cam, tf)| {
+        let vp = cam.logical_viewport_size()?;
+        Some((cam.clip_from_view() * tf.to_matrix().inverse(), vp))
+    });
+    let project = |p: Vec3| -> Option<Vec2> {
+        let (clip_from_world, vp) = view?;
+        let c = clip_from_world * p.extend(1.0);
+        if c.w <= 1e-4 {
+            return None;
+        }
+        let ndc = c.truncate() / c.w;
+        Some(Vec2::new((ndc.x * 0.5 + 0.5) * vp.x, (0.5 - ndc.y * 0.5) * vp.y))
+    };
     let mut have = 0usize;
     for (wl, mut node, mut vis, children) in &mut q {
         have = have.max(wl.0 + 1);
-        let Some((pos, s, size, color, icon, centred)) = req.list.get(wl.0) else {
+        let placed = req.list.get(wl.0).and_then(|r| {
+            let s = project(r.world)?;
+            // screen px per sprite px at the anchor
+            let k = project(r.world + basis.right * 100.0).map_or(1.0, |b| (b - s).length() / 100.0);
+            Some((r, s, k))
+        });
+        let Some((r, s, k)) = placed else {
             if *vis != Visibility::Hidden {
                 *vis = Visibility::Hidden;
             }
             continue;
         };
-        let size = size.clamp(6.0, 40.0);
-        let icon_w = if icon.is_some() { size * 2.0 } else { 0.0 };
-        let width = s.chars().count() as f32 * size * 0.62 + icon_w;
-        node.left = px(if *centred { pos.x - width * 0.5 } else { pos.x });
-        node.top = px(pos.y - size * 0.7);
+        let (text, color, icon, centred) = (&r.text, &r.color, &r.icon, r.centred);
+        let size = (r.size * k).clamp(6.0, 40.0);
+        let icon_w = if icon.is_some() {
+            (r.icon_size * k).clamp(8.0, 80.0)
+        } else {
+            0.0
+        };
+        let pos = s + Vec2::new(r.dx * k, 0.0);
+        let width = text.chars().count() as f32 * size * 0.62 + icon_w;
+        node.left = px(if centred { pos.x - width * 0.5 } else { pos.x });
+        node.top = px(pos.y - if icon.is_some() { icon_w.max(size * 1.2) * 0.5 } else { size * 0.7 });
         *vis = Visibility::Inherited;
         for c in children.iter() {
             if let Ok((mut t, mut tf, mut tc, mut sh)) = texts.get_mut(c) {
-                if t.0 != *s {
-                    t.0 = s.clone();
+                if t.0 != *text {
+                    t.0 = text.clone();
                 }
                 let cur = match tf.font_size {
                     FontSize::Px(v) => v,
@@ -561,8 +612,8 @@ fn place_labels(
                             img.color = Color::WHITE.with_alpha(a);
                         }
                         n.display = Display::Flex;
-                        n.width = px(size * 2.0);
-                        n.height = px(size * 2.0);
+                        n.width = px(icon_w);
+                        n.height = px(icon_w);
                     }
                     None => n.display = Display::None,
                 }

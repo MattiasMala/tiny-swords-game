@@ -366,6 +366,8 @@ def main():
     icons += sheet("icons_c", 2, 2, [(n, 48) for n in ["tent", "map", "eye", "banner"]], "Icons", box=64)
     META["icons"] = [name for name, _ in icons]
 
+    # the Rust client reads docs/spec/assets.json; these two files are only a by-product for reference
+    os.makedirs(os.path.join(ROOT, "js"), exist_ok=True)
     with open(os.path.join(ROOT, "js", "extra.js"), "w") as f:
         f.write("'use strict';\n// Generato da tools/make_sprites.py: misure degli sprite aggiuntivi in assets/Extra/.\n")
         f.write("const EXTRA = " + json.dumps(META, indent=1) + ";\n")
