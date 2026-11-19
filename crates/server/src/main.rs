@@ -2,25 +2,25 @@
 // /ws on the same port, application/wasm, no-cache, Origin check 403 `Origine non ammessa`, 400 `WebSocket
 // richiesto`), R2-R7 (one authoritative Room, tokens, snapshots) + addenda N1-N4.
 //
-// SKELETON (foundation):
-//   ts-server [porta] [--bind|-b INDIRIZZO]        defaults 8000 and 0.0.0.0
+//   ts-server [porta] [--bind|-b INDIRIZZO]        defaults 8000 and 0.0.0.0 (always reachable on the LAN)
 // * `/`        → `web/` (index.html, pkg/*.js, pkg/*.wasm as application/wasm), `Cache-Control: no-cache`, gzip/br
 // * `/assets`  → `assets/`;  `/fonts` → `fonts/` (the client embeds Fredoka; served anyway for tools/pages)
 // * `/ws`      → binary WebSocket, postcard `ts_sim::proto` (ClientMsg in, ServerMsg out)
 // * one shared lobby `Room` owned by a dedicated task (room_task.rs) ticking at 20 Hz
-//   (`MissedTickBehavior::Skip`); sockets talk to it through mpsc channels.
+//   (`MissedTickBehavior::Skip`); sockets talk to it through mpsc channels; per-connection ordered outbound queue
+//   with latest-wins snapshots (the room never blocks on a socket).
+// * sockets: client messages ≤ `MAX_CLIENT_MESSAGE` (64 KiB), WS ping every 5 s, dropped after 15 s of silence,
+//   more than `MAX_MSGS_PER_SEC` frames in a second → dropped; commands are also rate-limited by the room.
+// * Ctrl+C: every client gets `No{Il server ha chiuso la partita.}`, then the process exits.
 // Repo root: `--root DIR`, else the current dir if it has `web/` and `assets/`, else the source checkout
 // (CARGO_MANIFEST_DIR/../..).
-//
-// S6 TODO: per-connection backpressure (latest-wins snapshots), rate limiting, graceful `SERVER_CLOSED` notice,
-// logging roles (`+ {who} {id} da {ip}` with lobby roles), IPv6 LAN urls.
 
 mod lan;
 mod room_task;
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
@@ -30,10 +30,11 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use room_task::{Out, RoomEvent};
+use room_task::{ConnHandle, Out, RoomEvent};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_http::{
     compression::CompressionLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
@@ -98,6 +99,15 @@ struct AppCtx {
 
 static NEXT_CONN: AtomicU32 = AtomicU32::new(1);
 
+/// Max size of one client → server message (08 R7).
+const MAX_CLIENT_MESSAGE: usize = 64 << 10;
+/// WS ping period.
+const PING_EVERY: Duration = Duration::from_secs(5);
+/// Connection considered lost after this long without any frame from the client (08 N1).
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Frames per second above which a client is disconnected (flood).
+const MAX_MSGS_PER_SEC: u32 = 300;
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
@@ -106,6 +116,7 @@ async fn main() {
 
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(room_task::run(rx, urls.clone()));
+    let room_tx = tx.clone();
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -134,9 +145,17 @@ async fn main() {
     for u in &urls {
         println!("Gli altri giocatori aprono: {u}");
     }
-    let shutdown = async {
+    let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
+        // tell the players, give the writers a moment to flush, then exit (upgraded sockets would keep the
+        // graceful shutdown waiting)
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if room_tx.send(RoomEvent::Shutdown { done: done_tx }).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), done_rx).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         println!();
+        std::process::exit(0);
     };
     if let Err(e) = axum::serve(
         listener,
@@ -177,7 +196,9 @@ async fn ws_handler(
     let Ok(ws) = ws else {
         return plain(StatusCode::BAD_REQUEST, "WebSocket richiesto");
     };
-    ws.on_upgrade(move |socket| client(socket, peer, ctx))
+    ws.max_message_size(MAX_CLIENT_MESSAGE)
+        .max_frame_size(MAX_CLIENT_MESSAGE)
+        .on_upgrade(move |socket| client(socket, peer, ctx))
         .into_response()
 }
 
@@ -199,45 +220,86 @@ async fn client(socket: WebSocket, peer: SocketAddr, ctx: AppCtx) {
     println!("+ giocatore {id} da {}", peer.ip());
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
+    let handle = ConnHandle::new(out_tx);
     if ctx
         .room
         .send(RoomEvent::Connect {
             conn: id,
             token: new_token(),
-            out: out_tx,
+            out: handle.clone(),
         })
         .is_err()
     {
         return;
     }
-    let writer = tokio::spawn(async move {
-        while let Some(o) = out_rx.recv().await {
-            match o {
-                Out::Bin(b) => {
-                    if sink.send(Message::Binary(b.into())).await.is_err() {
+    // writer: the room's ordered queue + a ping every PING_EVERY
+    let mut writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(PING_EVERY);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
+        loop {
+            tokio::select! {
+                o = out_rx.recv() => {
+                    let Some(o) = o else { break };
+                    let (snap, len) = (matches!(o, Out::Snap(_)), o.len());
+                    let res = match o {
+                        Out::Bin(b) | Out::Snap(b) => sink.send(Message::Binary(b.into())).await,
+                        Out::Close => {
+                            let _ = sink.close().await;
+                            break;
+                        }
+                    };
+                    handle.written(snap, len);
+                    if res.is_err() {
                         break;
                     }
                 }
-                Out::Close => {
-                    let _ = sink.close().await;
-                    break;
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Bytes::from_static(b"ts"))).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
     });
-    while let Some(Ok(msg)) = stream.next().await {
-        match msg {
-            // malformed frames are dropped (08 R7)
-            Message::Binary(b) => {
-                if let Ok(m) = proto::decode::<ClientMsg>(&b)
-                    && ctx.room.send(RoomEvent::Msg { conn: id, msg: m }).is_err()
-                {
-                    break;
-                }
+    // reader: any frame (pong included) proves the client alive
+    let room = ctx.room.clone();
+    let reader = async move {
+        let mut window = tokio::time::Instant::now();
+        let mut count = 0u32;
+        loop {
+            let msg = match tokio::time::timeout(SILENCE_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(m))) => m,
+                // silence, socket error, stream end
+                _ => break,
+            };
+            let now = tokio::time::Instant::now();
+            if now.duration_since(window) >= Duration::from_secs(1) {
+                window = now;
+                count = 0;
             }
-            Message::Close(_) => break,
-            _ => {}
+            count += 1;
+            if count > MAX_MSGS_PER_SEC {
+                println!("giocatore {id}: troppi messaggi, connessione chiusa");
+                break;
+            }
+            match msg {
+                // malformed frames are dropped (08 R7)
+                Message::Binary(b) => {
+                    if let Ok(m) = proto::decode::<ClientMsg>(&b)
+                        && room.send(RoomEvent::Msg { conn: id, msg: m }).is_err()
+                    {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
         }
+    };
+    tokio::select! {
+        _ = reader => {}
+        _ = &mut writer => {}
     }
     let _ = ctx.room.send(RoomEvent::Disconnect { conn: id });
     writer.abort();

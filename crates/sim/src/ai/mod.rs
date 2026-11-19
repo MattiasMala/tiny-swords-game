@@ -10,9 +10,17 @@
 // Every faction carries an `AiState` (used only while `human == false`), so takeover / hand-back is toggling
 // `Faction.human` while the state is kept (faction.rs `takeover` / `reclaim`).
 //
-// Stub fns S5 must fill: ai_tick (STUB: no-op), ai_reset_for_takeover (MINIMAL: timers + wave reset, no plan
-// fast-forward). Add private submodules under ai/ freely.
-#![allow(dead_code, unused)]
+// Submodules: `util` (freeBuilding, queued, nearestEnemyFaction, aiWorth, findSpot), `intel` (aiIntel, aiPower,
+// aiEdge, aiWant), `econ` (pawns, aiBuild, plan, tech step, factories, training, aiNextUnit, market), `war`
+// (aiSpare, chooseTarget, aiLaunch, aiMarch, aiDefend, aiCapture, strays).
+
+pub mod econ;
+pub mod intel;
+pub mod util;
+pub mod war;
+
+#[cfg(test)]
+mod tests;
 
 use crate::World;
 use crate::defs::*;
@@ -99,17 +107,63 @@ impl AiState {
 
 impl World {
     /// `aiThink(f, level.think)` (04b §11): called by `update_faction` when `ai.think_t` expires (already reset).
-    /// STUB: no-op.
-    pub fn ai_tick(&mut self, f: FactionIdx) {}
+    /// Runs only for AI-driven kingdoms (`human == false`); `dt` = the level period, not the elapsed time.
+    pub fn ai_tick(&mut self, f: FactionIdx) {
+        let Some(fac) = self.factions.get(f as usize) else {
+            return;
+        };
+        if fac.human || !fac.alive || self.ai_castle(f).is_none() {
+            return;
+        }
+        let dt = fac.ai.level.def().think;
+        // 1. idle pawns to work
+        self.ai_assign_pawns(f, dt);
+        // 2. plan, houses, camps, rebuild, farms, tech step (`open` counted before anything is placed)
+        let open: u32 = self.factions[f as usize].sites.iter().map(|v| *v as u32).sum();
+        let step_cost = self.ai_plan(f, open);
+        // 3. intel (once per think) + desired army
+        let intel = self.ai_intel(f);
+        let mix = self.ai_want(f, &intel);
+        self.factions[f as usize].ai.mix = mix;
+        // 4. defense
+        self.ai_defend(f, &intel, step_cost);
+        // 5. extra factories
+        self.ai_factories(f, open);
+        // 6. training
+        self.ai_train(f, &intel, step_cost);
+        // 7. market
+        self.ai_market(f);
+        // 8. waves
+        self.factions[f as usize].ai.wave_t -= dt;
+        let (has_wave, wave_t) = {
+            let ai = &self.factions[f as usize].ai;
+            (ai.wave.is_some(), ai.wave_t)
+        };
+        if has_wave {
+            self.ai_march(f, &intel);
+        } else if wave_t <= 0.0 && intel.danger == 0.0 {
+            let now = self.time;
+            let ai = &mut self.factions[f as usize].ai;
+            if ai.due_t.is_none() {
+                ai.due_t = Some(now);
+            }
+            self.ai_launch(f, &intel);
+        }
+        // 9. capture squads (no-op while a wave exists)
+        self.ai_capture(f, &intel);
+        // 10. strays home
+        self.ai_strays(f);
+    }
 
     /// AI takeover procedure (04b addenda A1): forget wave/dueT/target, `think_t = rand(1,3)`,
     /// `wave_t = max(wave_t, rand(gap))`, `capture_t = max(capture_t, time + 60)`, fast-forward `step` past what
-    /// the kingdom already has (census must be fresh). MINIMAL: everything but the plan fast-forward.
+    /// the kingdom already has (census must be fresh: `takeover` runs it right before).
     pub fn ai_reset_for_takeover(&mut self, f: FactionIdx) {
         let time = self.time;
         let think = self.rng.range(AI_THINK_START.0, AI_THINK_START.1);
         let level = self.factions[f as usize].ai.level.def();
         let gap = self.rng.range(level.gap.0, level.gap.1);
+        let step = self.ai_plan_fast_forward(f);
         let ai = &mut self.factions[f as usize].ai;
         ai.wave = None;
         ai.due_t = None;
@@ -117,5 +171,44 @@ impl World {
         ai.think_t = think;
         ai.wave_t = ai.wave_t.max(gap);
         ai.capture_t = ai.capture_t.max(time + AI_CAPTURE_START);
+        ai.step = step;
+    }
+
+    /// Plan fast-forward of addenda A1: index of the first plan step whose building is not yet owned in
+    /// sufficient number (occurrences of that kind in `AI_PLAN[0..=i]` vs `has + sites`; farms/towers also
+    /// skipped at the level cap) or whose tech is neither researched nor in progress.
+    pub fn ai_plan_fast_forward(&self, f: FactionIdx) -> u16 {
+        let fac = &self.factions[f as usize];
+        let l = fac.ai.level.def();
+        let mut step = 0usize;
+        while step < AI_PLAN.len() {
+            match AI_PLAN[step] {
+                PlanStep::Build(k) => {
+                    let need = AI_PLAN[..=step]
+                        .iter()
+                        .filter(|s| **s == PlanStep::Build(k))
+                        .count() as u16;
+                    let owned = fac.has[k as usize] + fac.sites[k as usize];
+                    let cap = match k {
+                        BuildingKind::Farm => Some(l.farms),
+                        BuildingKind::Tower => Some(l.towers),
+                        _ => None,
+                    };
+                    if cap.is_some_and(|c| owned >= c) || owned >= need {
+                        step += 1;
+                        continue;
+                    }
+                    break;
+                }
+                PlanStep::Tech(t) => {
+                    if fac.techs.has(t) || fac.busy.has(t) {
+                        step += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        step as u16
     }
 }

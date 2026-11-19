@@ -11,7 +11,10 @@ pub mod consts;
 pub mod fx;
 pub mod light;
 pub mod sky;
+pub mod anim;
 pub mod sprites;
+pub mod sprites_overlay;
+pub mod sprites_world;
 pub mod terrain;
 pub mod water;
 

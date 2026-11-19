@@ -2,20 +2,18 @@
 // navigation: moveUnit, approach, travel, navTo, holdPost, eject rule), §7.5 (separation), §10.4 (killUnit),
 // §12.1 (scouts / frontier), §13 (updateUnit, unitAct) + addenda U2, U5, U6; 03b §4.8 (jobOf).
 //
-// Stub fns S2 must fill (the foundation left minimal working versions where noted "MINIMAL"):
-//   spawn_unit (MINIMAL), update_unit (skeleton of §13; verify order), separate_units (§7.5, no-op now),
-//   kill_unit (MINIMAL), set_order / idle (done per §5.1), move_unit / approach / travel / nav_to (done per §7.1-7.3,
-//   verify), hold_post (§7.3), update_scout + frontier (§12.1), unit_act / job_of (done), remove_dead_units (done).
-// RNG: only `World.rng` (thinkT, fearT staggering); `animT` randomness is client-side (addenda U6).
-#![allow(dead_code, unused)]
+// Implemented (complete): spawn_unit, update_unit (§13 order), separate_units (§7.5 + U2), kill_unit, set_order /
+// idle (§5.1), move_unit / approach / travel / nav_to / field_of (§7.1-7.3), hold_post, eject rule (§7.4),
+// update_scout + frontier (§12.1), unit_act / job_of, remove_dead_units.
+// RNG: only `World.rng` (thinkT, fearT staggering); `animT` and running-dust randomness are client-side (U6).
 
 use crate::World;
 use crate::defs::*;
-use crate::events::GameEvent;
-use crate::math::{V2, v2};
-use crate::path::{FieldId, FieldRef, FieldTarget};
+use crate::events::{GameEvent, Msg};
+use crate::math::V2;
+use crate::path::{FieldRef, FieldTarget};
 use crate::slab::UnitId;
-use crate::world::{DamageSource, GatherTarget, Order, Target, Unit, UnitState};
+use crate::world::{DamageSource, Order, Unit, UnitState};
 use crate::{TICK_DT, TILE};
 
 /// Result of `navTo` (entities.js:308-315).
@@ -31,7 +29,7 @@ pub enum NavResult {
 
 impl World {
     /// `spawnUnit(f, type, x, y)` (entities.js:250-268): new unit with faction stats; `think_t = rng*0.4`,
-    /// `fear_t = rng*0.4` [RNG]. MINIMAL: complete; S2 may add bookkeeping.
+    /// `fear_t = rng*0.4` [RNG] (in this order, entities.js:255-264).
     pub fn spawn_unit(&mut self, f: FactionIdx, kind: UnitKind, pos: V2) -> UnitId {
         let mut u = Unit::new(f, kind, pos, &self.factions[f as usize].mods);
         u.think_t = self.rng.f32() * 0.4;
@@ -39,7 +37,7 @@ impl World {
         self.units.insert(u)
     }
 
-    /// `updateUnit(u, dt)` (03a §13, entities.js:999-1027). Skeleton of the exact order; behaviour fns are stubs:
+    /// `updateUnit(u, dt)` (03a §13, entities.js:999-1027), in the exact JS order:
     /// sheltered → `update_pawn` only; timers; faith regen; `work` → idle; `tick_action` busy check; eject rule
     /// (§7.4); dispatch pawn / monk / scout / soldier; locomotion anim; `act`, `job`.
     /// Running-dust FX timers are client-side (addenda U6).
@@ -135,8 +133,98 @@ impl World {
     }
 
     /// `separateUnits()` (§7.5): pairwise push (R 32, strength 0.12, busy weight 0.2) via `map.try_move`, pairs
-    /// `i < j` in slab order (addenda U2). STUB: no-op.
-    pub fn separate_units(&mut self) {}
+    /// `i < j` in slab order (addenda U2: units killed this tick still take part; only sheltered ones are
+    /// skipped). The 64 px bucket grid (key `floor(x/64)*4096 + floor(y/64)`) is built once, from the positions
+    /// after the unit phase; pairs are visited `i` ascending then `j` ascending, positions updated in place.
+    pub fn separate_units(&mut self) {
+        let ids = self.units.ids();
+        let n = ids.len();
+        if n < 2 {
+            return;
+        }
+        let key = |p: V2| -> i64 {
+            (p.x / SEP_CELL).floor() as i64 * 4096 + (p.y / SEP_CELL).floor() as i64
+        };
+        // (bucket key, index) sorted → each bucket is a contiguous ascending run of indices
+        let mut cells: Vec<(i64, u32)> = Vec::with_capacity(n);
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(u) = self.units.get(*id)
+                && u.inside.is_none()
+            {
+                cells.push((key(u.pos), i as u32));
+            }
+        }
+        cells.sort_unstable();
+        let mut near: Vec<u32> = Vec::new();
+        for i in 0..n {
+            let Some(a) = self.units.get(ids[i]) else {
+                continue;
+            };
+            if a.inside.is_some() {
+                continue;
+            }
+            let k0 = key(a.pos);
+            near.clear();
+            for gx in -1..=1i64 {
+                for gy in -1..=1i64 {
+                    let k = k0 + gx * 4096 + gy;
+                    let start = cells.partition_point(|c| c.0 < k);
+                    for c in &cells[start..] {
+                        if c.0 != k {
+                            break;
+                        }
+                        if c.1 as usize > i {
+                            near.push(c.1);
+                        }
+                    }
+                }
+            }
+            if near.len() > 1 {
+                near.sort_unstable();
+            }
+            for &j in &near {
+                let (Some(a), Some(b)) = (self.units.get(ids[i]), self.units.get(ids[j as usize]))
+                else {
+                    continue;
+                };
+                let dx = b.pos.x - a.pos.x;
+                let dy = b.pos.y - a.pos.y;
+                if dx.abs() > SEP_RADIUS || dy.abs() > SEP_RADIUS {
+                    continue;
+                }
+                let d = dx.hypot(dy);
+                if d >= SEP_RADIUS {
+                    continue;
+                }
+                let push = (SEP_RADIUS - d) * SEP_STRENGTH;
+                let (ux, uy) = if d > 0.01 {
+                    (dx / d, dy / d)
+                } else {
+                    ((i as f32).cos(), (i as f32).sin())
+                };
+                let busy = |s: UnitState| {
+                    if matches!(s, UnitState::Work | UnitState::Attack) {
+                        SEP_BUSY_WEIGHT
+                    } else {
+                        1.0
+                    }
+                };
+                let (wa, wb) = (busy(a.state), busy(b.state));
+                let (pa, sa, ca) = (a.pos, side_of(a.faction), a.cross);
+                let (pb, sb, cb) = (b.pos, side_of(b.faction), b.cross);
+                let na = self
+                    .map
+                    .try_move(pa, -ux * push * wa, -uy * push * wa, sa, ca);
+                if let Some(a) = self.units.get_mut(ids[i]) {
+                    a.pos = na;
+                }
+                let nb = self.map.try_move(pb, ux * push * wb, uy * push * wb, sb, cb);
+                if let Some(b) = self.units.get_mut(ids[j as usize]) {
+                    b.pos = nb;
+                }
+            }
+        }
+    }
 
     /// Drops dead units from the slab (main.js:297).
     pub fn remove_dead_units(&mut self) {
@@ -144,7 +232,7 @@ impl World {
     }
 
     /// `killUnit(u, by)` (§10.4): leave shelter, dead, release node, FX `boom1` (x, y-22, dy 60) + sound `death`,
-    /// kill credit to another faction. MINIMAL: complete except S3 shelter details.
+    /// kill credit to another faction (no corpse: the unit vanishes in an explosion puff).
     pub fn kill_unit(&mut self, id: UnitId, by: DamageSource) {
         let Some(u) = self.units.get(id) else { return };
         if u.dead {
@@ -330,24 +418,121 @@ impl World {
     }
 
     /// `holdPost(u, dt)` (§7.3): if > 48 px from the post walk back (`travel` near 24); if it cannot arrive the
-    /// post becomes where it stands. STUB: no-op.
-    pub fn hold_post(&mut self, id: UnitId) {}
-
-    /// `updateScout(u)` (§12.1): idle → hold post; other orders → travel then idle; explore → frontier goals,
-    /// `bad` cells, toast `Msg::ExploreDone` for humans when nothing is left. STUB: plain move only.
-    pub fn update_scout(&mut self, id: UnitId) {
+    /// post becomes where it stands.
+    pub fn hold_post(&mut self, id: UnitId) {
         let Some(u) = self.units.get(id) else { return };
-        if let Order::Move(m) = u.order.clone()
-            && self.travel(id, m.to, TRAVEL_NEAR)
+        let Order::Idle { post, .. } = u.order else {
+            return;
+        };
+        if post.dist(u.pos) > HOLD_POST_DIST
+            && self.travel(id, post, HOLD_POST_NEAR)
+            && let Some(u) = self.units.get_mut(id)
+            && let Order::Idle { post, .. } = &mut u.order
         {
-            self.idle(id);
+            *post = u.pos;
         }
     }
 
-    /// `frontier(u, bad)` (§12.1): nearest (walking distance) unexplored cell on the 3-cell lattice, not in `bad`.
-    /// `None` for AI (no fog) or when nothing is left. STUB.
+    /// `updateScout(u)` (§12.1): idle → hold post; other orders → travel then idle; explore → frontier goals,
+    /// `bad` cells, toast `Msg::ExploreDone` for humans when nothing is left.
+    pub fn update_scout(&mut self, id: UnitId) {
+        let Some(u) = self.units.get(id) else { return };
+        let f = u.faction;
+        let goal = match &u.order {
+            Order::Idle { .. } => {
+                self.hold_post(id);
+                return;
+            }
+            Order::Move(m) | Order::AMove(m) => {
+                let to = m.to;
+                if self.travel(id, to, TRAVEL_NEAR) {
+                    self.idle(id);
+                }
+                return;
+            }
+            Order::Explore { goal, .. } => *goal,
+            _ => {
+                // scouts never fight / gather: anything else just stops
+                self.idle(id);
+                return;
+            }
+        };
+        let mut next = goal.is_none_or(|g| self.explored(f, g));
+        if !next
+            && let Some(g) = goal
+            && self.travel(id, g, EXPLORE_NEAR)
+        {
+            // reached, or cannot get there: try another one
+            next = true;
+            let c = self.map.cell_of(g);
+            if let Some(u) = self.units.get_mut(id)
+                && let Order::Explore { bad, .. } = &mut u.order
+                && !bad.contains(&c)
+            {
+                bad.push(c);
+            }
+        }
+        if !next {
+            return;
+        }
+        let bad = match self.units.get(id).map(|u| &u.order) {
+            Some(Order::Explore { bad, .. }) => bad.clone(),
+            _ => Vec::new(),
+        };
+        let g = self.frontier(id, &bad);
+        if let Some(u) = self.units.get_mut(id) {
+            if let Order::Explore { goal, .. } = &mut u.order {
+                *goal = g;
+            }
+            u.best_d = f32::INFINITY;
+            u.stall_t = 0.0;
+        }
+        if g.is_none() {
+            self.idle(id);
+            if self.factions[f as usize].human {
+                self.emit(GameEvent::Toast {
+                    to: f,
+                    msg: Msg::ExploreDone,
+                });
+            }
+        }
+    }
+
+    /// `frontier(u, bad)` (§12.1): nearest (walking distance) unexplored cell on the 3-cell lattice
+    /// (`x, y = 2, 5, 8, … < W-2 / H-2`), not in `bad`. `None` for AI-driven kingdoms (no fog) or when nothing is
+    /// left.
     pub fn frontier(&mut self, id: UnitId, bad: &[i32]) -> Option<V2> {
-        None
+        let u = self.units.get(id)?;
+        let f = u.faction;
+        if !self.factions[f as usize].human {
+            return None;
+        }
+        let side = side_of(f);
+        let here = self.map.cell_of(u.pos);
+        if here < 0 {
+            return None;
+        }
+        let fr = self.field_to_cell(here, side, here);
+        let field = self.fields.field(fr.id);
+        let seen = &self.factions[f as usize].fog.explored;
+        let (w, h) = (self.map.w, self.map.h);
+        let mut best = -1;
+        let mut bd = FIELD_INF;
+        let mut y = 2;
+        while y < h - 2 {
+            let mut c = y * w + 2;
+            let end = y * w + w - 2;
+            while c < end {
+                let fc = field.get(c as usize).copied().unwrap_or(FIELD_INF);
+                if fc < bd && !seen.get(c as usize) && !bad.contains(&c) {
+                    bd = fc;
+                    best = c;
+                }
+                c += 3;
+            }
+            y += 3;
+        }
+        (best >= 0).then(|| self.map.center(best))
     }
 
     /// `unitAct(u)` (§13 / 03b §4.8).

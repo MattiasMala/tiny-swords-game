@@ -1,16 +1,34 @@
 // OWNER: S1 (map) — see docs/spec/02-world.md §1-§4, §6, §8 and 09-asset-inventory.md §3.6, §11.
 //
-// The foundation wrote the data model AND faithful ports of the simple queries of spec 02 §3 (passable, crossable,
-// linkOK, stepOK, tryMove, clearLine, nearestPassable, setBlock/setOwner/resetBlock, canPlace). S1 owns the file:
-// verify them against the spec, extend the rendering layers (Surface/Decor) for the HD-2D generator, and keep every
-// signature stable (other modules call them). Cells are `i32` so the JS `-1` "outside" sentinel survives; every
-// accessor bounds-checks (02 addenda W6).
+// Grid data model + the queries of spec 02 §3 (passable, crossable, linkOK, stepOK, tryMove, clearLine,
+// nearestPassable, setBlock/setOwner/resetBlock, canPlace, ring). Cells are `i32` so the JS `-1` "outside" sentinel
+// survives; every accessor bounds-checks (02 addenda W6).
 //
-// S1 TODO list for this file:
-//   * spec 02 §2: keep the per-cell layers; add any rendering layer the voxel terrain needs (e.g. height offsets,
-//     biome ids) — client C1 reads `Map` directly.
-//   * spec 09 §3.6/§11: `Surface` assignment is done by mapgen; extend `Surface`/`DecorKind` if the art needs it.
-//   * `hash()`: the client regenerates the map from the seed and compares this hash (08-net R5).
+// ## How a renderer reads a `Map` (contract with the client, C1 terrain / C2 sprites)
+//
+// * **Height**: a land cell (`land > 0`) is a column whose top is at terrain level `level[c]` (0 lowland, 1
+//   plateau, 2 terrace). Water (`land == 0`) is the sea/pond plane; `depth[c]` = Chebyshev distance to the nearest
+//   ground (1 = touching the shore, capped at 15; 0 on ground) for shallow/deep shading and foam.
+// * **Cliffs**: `cliff[c] == 1` is the cell just SOUTH of a raised cell's south edge. Its `level` is the LOWER one
+//   (gameplay: never walkable). In the 2D art the rock face of the tier above is painted over this cell (`land 1`:
+//   foot on grass, tileset row 4; `land 0`: foot in the water, row 5 — a cliff dropping into the sea). A voxel
+//   renderer should draw the cell as a rock column rising to the level of the cell north of it
+//   (`Map::cliff_top(c)`), i.e. the wall face sits at the cell's south side, the top is the plateau rim. Only
+//   south edges have cliff cells; east/west/north borders of a plateau are just level steps (draw a rock side).
+//   Runs are ≥ 3 cells, never one-cell jaggies (generator invariant).
+// * **Stairs** (ramps): `stair` 1/3 = lower half (keeps the lower level), 2/4 = upper half (has the upper level);
+//   1/2 = left ramp (west of the plateau's bottom-left corner, rising toward the east), 3/4 = right ramp (east of the
+//   bottom-right corner, rising toward the west). The two halves are vertically adjacent: upper at row y (beside
+//   the plateau's bottom row), lower at row y+1 (beside the cliff run's end). Draw them as one slope from the lower
+//   level at the lower half's south edge to the upper level at the upper half's north edge, textured like the
+//   tier above (`surface` of both halves = upper tier).
+// * **Surface**: ground material per cell (see [`Surface`]); cliff cells carry the surface of the tier above them.
+// * **plateau**: 1-based index into `GeneratedWorld.plateaus` (cells of level ≥ 1, their cliffs and stairs), 0
+//   elsewhere — handy to group a plateau's blocks.
+// * **Decor**: see [`Decor`]/[`DecorKind`]. All decor positions are sim px foot points; the ground height under a
+//   decoration is the level of `cell_at(x, y - 1)` (water decorations: the water plane). Solid props are already in
+//   `static_block` (wide props over two cells).
+// * `land == 2` = islets: scenery ground (never walkable), may be raised (`level 1`) with a `cliff` row below.
 #![allow(dead_code)]
 
 use crate::defs::{BuildingKind, DIRS8, MOVE_PROBE, PropKind};
@@ -28,24 +46,25 @@ pub const N: usize = MAP_W * MAP_H;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Surface {
-    /// sea / pond (`#47aba9`)
+    /// sea / pond / cliff foot in the water (`#47aba9`)
     #[default]
     Water,
-    /// beach (derived texture, spec 09 §3.7)
+    /// beach on some stretches of low coast (derived texture, spec 09 §3.7: base `#d8c28e`, dark `#c4a77a`,
+    /// light `#e8d9a8`, mint shore rim kept)
     Sand,
-    /// low / coastal tier — `Tilemap_color3` (emerald)
+    /// level 0 (lowland / coastal tier) — `Tilemap_color3` (emerald)
     GrassLow,
-    /// main tier — `Tilemap_color1` (yellow-green)
+    /// level 1 (plateau) — `Tilemap_color1` (yellow-green, the brightest)
     GrassMid,
-    /// top terrace — `Tilemap_color2` (fresh green)
+    /// level 2 (terrace) — `Tilemap_color2` (fresh green)
     GrassTop,
-    /// dry / olive — `Tilemap_color4`
+    /// dry meadow patches, graveyards, dead-tree corners (lowland) — `Tilemap_color4` (olive)
     GrassDry,
-    /// pine-forest floor — `Tilemap_color5` (teal)
+    /// floor of the dense pine woods (lowland) — `Tilemap_color5` (teal)
     ForestFloor,
-    /// bare dirt (farm plots, under buildings; derived texture)
+    /// bare dirt: farm plots, camp grounds, hamlet yards (derived texture, 09 §3.7: `#805a53`/`#70504e`/`#9a6f5e`)
     Dirt,
-    /// trodden dirt path between castles
+    /// trodden dirt road between castles / to capture points, castle plazas (lighter dirt; walkable, buildable)
     Path,
 }
 
@@ -66,19 +85,24 @@ impl Surface {
 /// Kind of a purely visual decoration (never blocks unless `Decor.solid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DecorKind {
-    /// `Terrain/Decorations/Bushes/Bushe{v+1}.png` (fw 128, anchor 64,80, 8 fps, 8 frames)
+    /// `Terrain/Decorations/Bushes/Bushe{v+1}.png` (fw 128, anchor 64,80, 8 fps, 8 frames, frame `t*8 + phase`):
+    /// transition glue at cliff feet, beside stairs, on coast/plateau corners, around woods, on islets
     Bush,
-    /// `Terrain/Decorations/Rocks/Rock{v+1}.png` (drawn at x-32, y-50)
+    /// `Terrain/Decorations/Rocks/Rock{v+1}.png` (anchor 32,50; static)
     Rock,
-    /// `Rocks in the Water/Water Rocks_0{v+1}.png` (16 frames of 64)
+    /// `Rocks in the Water/Water Rocks_0{v+1}.png` (16 frames of 64, 10 fps, anchor 32,36, frame `t*10 + phase`)
     WaterRock,
-    /// `Rubber Duck/Rubber duck.png` (3 frames of 32)
+    /// `Rubber Duck/Rubber duck.png` (3 frames of 32, 4 fps): swims around `(x, y)` (radius 18 px on ponds — a
+    /// duck whose position is a pond centre — else 46 px), 09 §4.4
     Duck,
-    /// `Clouds/Clouds_0{v+1}.png` (drifts east at `scale` px/s on the client)
+    /// `Clouds/Clouds_0{v+1}.png`, `(x, y)` = top-left at time 0; drifts east at `scale` px/s, wraps at
+    /// `x > mapW + 100` to `x = -600` (02 §6 / 09 §6)
     Cloud,
-    /// unreachable scenery tree (islets, map border forests): `Trees/Tree{v+1}.png`
+    /// unreachable scenery tree on islets: `Trees/Tree{v+1}.png` (v 0/1 pines, 2/3 birches; foot = cell centre
+    /// + 22 px like tree nodes)
     Tree,
-    /// `Extra/Props/{name}.png`, anchored bottom-centre
+    /// `Extra/Props/{name}.png`, anchored bottom-centre (`PropKind::size`). Walk-over details are non-solid; water
+    /// props (boat, dock, shipwreck, reeds, lilypads) stand on water cells
     Prop(PropKind),
 }
 
@@ -94,14 +118,27 @@ pub struct Decor {
     pub phase: f32,
     /// draw scale (clouds: drift speed px/s)
     pub scale: f32,
-    /// blocks its cell (solid props: camps, landmarks) — already counted in `Map.static_block`
+    /// blocks its cell (solid props: camps, landmarks; wide props block the two cells either side of `x`) — already
+    /// counted in `Map.static_block`
     pub solid: bool,
+}
+
+impl Decor {
+    /// Cell the decoration stands on (`cell_at(x, y - 1)`; solid props: their blocked cell, or the left one of a
+    /// wide prop's pair). -1 outside the map (clouds).
+    pub fn cell(&self, map: &Map) -> i32 {
+        match self.kind {
+            DecorKind::Prop(_) if self.solid => map.cell_at(self.x - 1.0, self.y - 21.0),
+            _ => map.cell_at(self.x, self.y - 1.0),
+        }
+    }
 }
 
 /// A raised area (spec 02 §2.1 `plateaus`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlateauInfo {
-    /// tileset / biome id 1..4 (render only)
+    /// 1-based index of this plateau in `GeneratedWorld.plateaus` (= value of `Map.plateau` on its cells); plateaus
+    /// are ordered by distance to the bases' centroid (index 1 = the richest, 3 gold groups)
     pub id: u8,
     /// landing cell at the top of its first stair (reachability goal)
     pub landing: (i32, i32),
@@ -180,7 +217,7 @@ pub struct Map {
     pub cliff: Vec<u8>,
     /// 0 none; 1 left-lower, 2 left-upper, 3 right-lower, 4 right-upper (odd = lower half)
     pub stair: Vec<u8>,
-    /// plateau tileset id 1..4 (render)
+    /// 1-based plateau index (`GeneratedWorld.plateaus[i-1]`) of raised cells, their cliffs and stairs; 0 elsewhere
     pub plateau: Vec<u8>,
     /// 1 = buildings cannot be placed
     pub no_build: Vec<u8>,
@@ -198,8 +235,11 @@ pub struct Map {
     pub version: u32,
     /// `version` when a cell was last freed
     pub opened: u32,
-    /// ground material per cell (render)
+    /// ground material per cell (render, see [`Surface`])
     pub surface: Vec<Surface>,
+    /// water cells: Chebyshev distance to the nearest ground (`land > 0` or sea cliff), 1..=15; 0 on ground (render)
+    #[serde(default)]
+    pub depth: Vec<u8>,
     /// decorations (render; solid ones also in `static_block`)
     pub decor: Vec<Decor>,
 }
@@ -229,6 +269,7 @@ impl Map {
             version: 1,
             opened: 1,
             surface: vec![Surface::Water; n],
+            depth: vec![0; n],
             decor: Vec::new(),
         }
     }
@@ -321,6 +362,20 @@ impl Map {
     #[inline]
     pub fn is_stair(&self, c: i32) -> bool {
         Map::at(&self.stair, c) != 0
+    }
+
+    /// Render height (terrain level) of the top of a cell's column: the cell's level, or for a cliff cell the
+    /// level of the raised cell north of it (the rim of the wall). Water without cliff → `None`.
+    #[inline]
+    pub fn cliff_top(&self, c: i32) -> Option<u8> {
+        if !self.valid(c) {
+            return None;
+        }
+        let i = c as usize;
+        if self.cliff[i] != 0 {
+            return Some(self.level_at(c - self.w).max(self.level[i]));
+        }
+        if self.land[i] == 0 { None } else { Some(self.level[i]) }
     }
 
     /// `passable(c, side)`: may stand here (free, or own palisade).
@@ -537,11 +592,24 @@ impl Map {
     /// insertion-ordered, without duplicates.
     pub fn ring(&self, cells: &[i32], side: u8) -> Vec<i32> {
         let mut out: Vec<i32> = Vec::new();
+        self.ring_into(cells, side, &mut out);
+        out
+    }
+
+    /// [`Map::ring`] appended to `out` (cleared first) — no allocation when `out` has capacity.
+    pub fn ring_into(&self, cells: &[i32], side: u8, out: &mut Vec<i32>) {
+        out.clear();
         let Some(&first) = cells.first() else {
-            return out;
+            return;
         };
+        if !self.valid(first) {
+            return;
+        }
         let lvl = self.level_at(first);
         for &c in cells {
+            if !self.valid(c) {
+                continue;
+            }
             let (x, y) = self.xy(c);
             for (dx, dy) in DIRS8 {
                 if !self.inside(x + dx, y + dy) {
@@ -557,7 +625,6 @@ impl Map {
                 }
             }
         }
-        out
     }
 
     /// FNV-1a hash of the generated gameplay layers (client verifies its regenerated map against the server's).

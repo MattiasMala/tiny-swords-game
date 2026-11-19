@@ -4,23 +4,122 @@
 <meta charset="utf-8">
 <title>Tiny Swords — La Guerra dei Cinque Regni</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- OWNER: C4 (web/**). Built by build-web.ps1 / build-web.sh into ./pkg (wasm-bindgen --target web). -->
+<!-- OWNER: C4 (web/**). Built by build-web.ps1 / build-web.sh into ./pkg (wasm-bindgen --target web), served by ts-server. -->
 <style>
   html, body { margin: 0; width: 100%; height: 100%; background: #47aba9; overflow: hidden; }
   canvas#game { display: block; width: 100%; height: 100%; outline: none; }
+  #boot {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; background: #47aba9; color: #fff; font: 600 16px/1.4 system-ui, "Segoe UI", sans-serif;
+    text-shadow: 0 2px 0 #1b1f33; text-align: center; padding: 16px; box-sizing: border-box; z-index: 10;
+  }
+  #boot h1 { margin: 0; font-size: 34px; letter-spacing: 1px; }
+  #boot .bar { width: min(420px, 60vw); height: 16px; border: 3px solid #1b1f33; border-radius: 3px; background: #2f6f6d; }
+  #boot .fill { width: 0; height: 100%; background: #e3c84e; transition: width .15s; }
+  #boot .err { max-width: 640px; font-size: 18px; color: #fff7c9; }
+  #boot.done { display: none; }
 </style>
 </head>
 <body>
 <canvas id="game" tabindex="0"></canvas>
+<div id="boot">
+  <h1>Tiny Swords</h1>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div id="msg">Caricamento del gioco…</div>
+</div>
 <script type="module">
   const canvas = document.getElementById('game');
+  const boot = document.getElementById('boot');
+  const msg = document.getElementById('msg');
+  const fill = document.getElementById('fill');
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-  canvas.focus();
-  import init from './pkg/ts_client.js';
-  init().catch((e) => {
-    // winit uses an exception for control flow on the web: ignore it, report anything else
-    if (!String(e).includes('Using exceptions for control flow')) console.error(e);
+  canvas.addEventListener('mousedown', () => canvas.focus());
+
+  function fail(text) {
+    boot.classList.remove('done');
+    boot.querySelector('.bar').style.display = 'none';
+    msg.className = 'err';
+    msg.textContent = text;
+  }
+
+  function hasWebGL2() {
+    try {
+      const c = document.createElement('canvas');
+      return !!(window.WebGL2RenderingContext && c.getContext('webgl2'));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Downloads the wasm with a progress bar (the bundle is several MB), then hands the bytes to wasm-bindgen.
+  async function fetchWasm(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+    const total = Number(res.headers.get('content-length')) || 0;
+    if (!res.body || !res.body.getReader) return res;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      const mb = (got / 1048576).toFixed(1);
+      msg.textContent = `Caricamento del gioco… ${mb} MB`;
+      // content-length is the compressed size when the server compresses: clamp
+      fill.style.width = total ? `${Math.min(100, (got / total) * 100)}%` : `${Math.min(95, got / 200000)}%`;
+    }
+    fill.style.width = '100%';
+    return new Response(new Blob(chunks), { headers: { 'Content-Type': 'application/wasm' } });
+  }
+
+  async function start() {
+    if (!hasWebGL2()) {
+      fail('Questo browser non supporta WebGL2, che serve al gioco. Prova con un browser aggiornato (Chrome, Edge, Firefox o Safari) e con l\'accelerazione hardware attiva.');
+      return;
+    }
+    let init;
+    try {
+      ({ default: init } = await import('./pkg/ts_client.js'));
+    } catch (e) {
+      console.error(e);
+      fail('Impossibile caricare il gioco: manca la build web (esegui build-web.ps1 o build-web.sh).');
+      return;
+    }
+    try {
+      const wasm = await fetchWasm('./pkg/ts_client_bg.wasm');
+      msg.textContent = 'Avvio…';
+      const started = init({ module_or_path: wasm });
+      // the app is running once Bevy has sized the canvas (winit then owns the event loop)
+      const ready = setInterval(() => {
+        if (canvas.width > 0 && canvas.height > 0 && canvas.width !== 300) {
+          clearInterval(ready);
+          boot.classList.add('done');
+          canvas.focus();
+        }
+      }, 100);
+      await started;
+    } catch (e) {
+      // winit uses an exception for control flow on the web: that one means "running"
+      if (String(e).includes('Using exceptions for control flow')) {
+        boot.classList.add('done');
+        canvas.focus();
+        return;
+      }
+      console.error(e);
+      fail(`Impossibile avviare il gioco: ${e && e.message ? e.message : e}`);
+    }
+  }
+  // a panic aborts the wasm instance (RuntimeError: unreachable): say so instead of leaving a frozen canvas
+  window.addEventListener('error', (ev) => {
+    const t = String((ev && (ev.error || ev.message)) || '');
+    if (t.includes('Using exceptions for control flow')) return;
+    if (/RuntimeError|unreachable/.test(t)) {
+      fail('Il gioco si è fermato per un errore. Ricarica la pagina (la partita in rete riprende da dove eri).');
+    }
   });
+  start();
 </script>
 </body>
 </html>

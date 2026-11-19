@@ -24,8 +24,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# wasm: smaller + fast. Built with: cargo build --profile wasm-release --target wasm32-unknown-unknown -p ts-client
+# wasm (OWNER C4, see build-web.*): size-optimised. The old opt-level 3 build was 49.5 MB (43 MB of code, no debug
+# info): "s" + fat LTO + one codegen unit, then wasm-opt. Built with:
+#   cargo build -p ts-client --lib --profile wasm-release --target wasm32-unknown-unknown
 [profile.wasm-release]
 inherits = "release"
-opt-level = 3
+opt-level = "s"
 lto = "fat"
+codegen-units = 1
+debug = false
+# debuginfo only: keeps the custom sections wasm-bindgen reads
+strip = "debuginfo"
+panic = "abort"

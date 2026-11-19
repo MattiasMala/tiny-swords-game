@@ -9,6 +9,8 @@
 // * `--cam X,Y`       centre the camera on tile (X, Y) instead of the own castle
 // * `--zoom Z`        camera zoom factor (1 = default distance, 2 = twice as close)
 // * `--time T`        day time 0..1 (0 = dawn), read by `render::light` (overrides the sim day phase)
+// * `--place KIND`    (C4 input testing) start placing building KIND (`house`, `wall`, `tower` …) once the match runs
+// * `--select WHAT`   (C4 input testing) select `pawns` / `army` / `castle` once the match runs
 //
 // On wasm everything stays at its default (the browser has no argv).
 
@@ -27,6 +29,10 @@ pub struct DevArgs {
     pub cam: Option<Vec2>,
     pub zoom: Option<f32>,
     pub time: Option<f32>,
+    /// building key to start placing (input testing)
+    pub place: Option<String>,
+    /// `pawns` / `army` / `castle`: initial selection (input testing)
+    pub select: Option<String>,
 }
 
 impl DevArgs {
@@ -65,6 +71,8 @@ impl DevArgs {
                 }
                 "--zoom" => d.zoom = it.next().and_then(|v| v.parse().ok()),
                 "--time" => d.time = it.next().and_then(|v| v.parse().ok()),
+                "--place" => d.place = it.next(),
+                "--select" => d.select = it.next(),
                 other => warn!("argomento sconosciuto: {other}"),
             }
         }
